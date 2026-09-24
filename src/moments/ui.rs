@@ -447,10 +447,10 @@ impl MomentsPanel {
         self.redraw(cx);
     }
     fn back(&mut self, cx: &mut Cx) {
-        if self.editing.take().is_some() {
-            self.text_input(cx, ids!(moments_comment)).set_text(cx, "");
-            self.redraw(cx);
-            return;
+        // Editing must never consume navigation, including stale edit state
+        // left behind after a post disappears from the detail page.
+        if self.page == Page::Details || self.editing.is_some() {
+            self.leave_detail(cx);
         }
         if self.page == Page::Feed || self.page == Page::Transfer {
             cx.action(MomentsAction::Close);
@@ -462,6 +462,11 @@ impl MomentsPanel {
             Page::Feed
         };
         self.redraw(cx);
+    }
+    fn leave_detail(&mut self, cx: &mut Cx) {
+        self.editing = None;
+        self.detail = None;
+        self.text_input(cx, ids!(moments_comment)).set_text(cx, "");
     }
     fn open_detail(&mut self, cx: &mut Cx, post: Entry) {
         self.media_index = 0;
@@ -899,6 +904,7 @@ impl Widget for MomentsPanel {
                         );
                     }
                     if self.button(cx, ids!(moments_hide)).clicked(actions) {
+                        self.leave_detail(cx);
                         self.page = Page::Feed;
                         self.run(cx, Command::Hide(post.sender.clone(), true));
                     }
@@ -912,6 +918,7 @@ impl Widget for MomentsPanel {
                             cx,
                             Command::Redact(post.room.clone(), vec![post.id.clone()]),
                         );
+                        self.leave_detail(cx);
                         self.page = Page::Feed;
                     }
                     if self.button(cx, ids!(moments_comment_send)).clicked(actions)
@@ -1231,7 +1238,7 @@ impl Widget for MomentsPanel {
         self.label(cx, ids!(editor_hint))
             .set_visible(cx, self.editing.is_some());
         self.label(cx, ids!(editor_hint))
-            .set_text(cx, crate::i18n::tr("Editing your text · Back cancels editing"));
+            .set_text(cx, crate::i18n::tr("Editing your text · Back discards changes and returns"));
         if let Some(post) = self.detail.clone() {
             if let Some(t) = self.feed.timelines.get(&post.room) {
                 if let Some(updated) = t
@@ -1242,7 +1249,7 @@ impl Widget for MomentsPanel {
                 {
                     self.detail = Some(updated);
                 } else if t.loaded {
-                    self.detail = None;
+                    self.leave_detail(cx);
                     self.status = crate::i18n::tr("This post was removed.").into();
                     self.page = Page::Feed;
                 }
@@ -1550,6 +1557,75 @@ impl MomentsPanelRef {
                 inner.run(cx, Command::FileTransfer(false));
             }
             MomentsAction::Close => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod navigation_tests {
+    use super::*;
+
+    fn panel() -> (Cx, MomentsPanel) {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let panel = cx.with_vm(|vm| {
+            makepad_widgets::script_mod(vm);
+            MomentsPanel::script_new(vm)
+        });
+        (cx, panel)
+    }
+
+    fn edited_post() -> Entry {
+        Entry {
+            room: ruma::room_id!("!moments:example.org").to_owned(),
+            id: ruma::event_id!("$post").to_owned(),
+            sender: ruma::user_id!("@author:example.org").to_owned(),
+            timestamp: 0,
+            content: super::super::model::post_content("Published text", &[]),
+            edited: false,
+        }
+    }
+
+    #[test]
+    fn back_during_edit_returns_to_feed_immediately() {
+        let (mut cx, mut panel) = panel();
+        panel.page = Page::Details;
+        panel.detail = Some(edited_post());
+        panel.editing = panel.detail.clone();
+        panel.back(&mut cx);
+        assert!(panel.page == Page::Feed);
+        assert!(panel.editing.is_none());
+        assert!(panel.detail.is_none());
+    }
+
+    #[test]
+    fn feed_back_closes_even_with_stale_edit_state() {
+        let (mut cx, mut panel) = panel();
+        panel.editing = Some(edited_post());
+        let actions = cx.capture_actions(|cx| panel.back(cx));
+        assert!(actions.iter().any(|a| matches!(
+            a.downcast_ref::<MomentsAction>(), Some(MomentsAction::Close)
+        )));
+        assert!(panel.editing.is_none());
+    }
+
+    #[test]
+    fn back_does_not_wait_for_in_flight_operation() {
+        let (mut cx, mut panel) = panel();
+        panel.page = Page::Compose;
+        panel.busy = true;
+        panel.mutating = true;
+        panel.back(&mut cx);
+        assert!(panel.page == Page::Feed);
+    }
+
+    #[test]
+    fn audience_back_returns_to_its_opening_page() {
+        let (mut cx, mut panel) = panel();
+        for destination in [Page::Feed, Page::Compose] {
+            panel.page = Page::Audience;
+            panel.audience_return = destination;
+            panel.back(&mut cx);
+            assert!(panel.page == destination);
         }
     }
 }

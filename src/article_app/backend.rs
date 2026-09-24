@@ -18,6 +18,13 @@ use super::{
     model::Grant,
 };
 pub const ARTICLE_KEY: &str = "org.octosense.article";
+// Matrix caps the complete federated event at 65,536 bytes. Megolm expands
+// plaintext by roughly 4/3, in addition to its envelope, padding and signatures.
+// Keep room for those and the server's event metadata; 58 KB of plaintext does
+// not fit once encrypted. Measure serialized UTF-8 JSON, including retry IDs.
+const ENCRYPTED_CONTENT_LIMIT: usize = 44 * 1024;
+const PLAIN_CONTENT_LIMIT: usize = 58_000;
+const ARTICLE_DATA_LIMIT: usize = 55_000;
 static WRITES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -26,6 +33,7 @@ pub struct ArticleContent {
     pub version: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transaction_id: Option<String>,
+    #[serde(serialize_with = "serialize_wire_document")]
     pub document: Document,
     pub assets: BTreeMap<String, RemoteAsset>,
 }
@@ -36,7 +44,7 @@ impl ArticleContent {
             .unwrap_or(content)
             .get(ARTICLE_KEY)
             .ok_or("Not a Rinx article")?;
-        if serde_json::to_vec(value).map_err(|e| e.to_string())?.len() > 55_000 {
+        if serde_json::to_vec(value).map_err(|e| e.to_string())?.len() > ARTICLE_DATA_LIMIT {
             return Err("Article is too large".into());
         }
         let article: Self =
@@ -84,13 +92,61 @@ impl ArticleContent {
         Ok(article)
     }
 }
+/// Omit only fields that schema 2 readers already restore from serde defaults.
+/// This is a wire optimization: changing Document/Block serialization itself
+/// would invalidate the digest used to retain a draft's original Markdown.
+fn serialize_wire_document<S: serde::Serializer>(doc: &Document, serializer: S) -> Result<S::Ok, S::Error> {
+    let mut value = serde_json::to_value(doc).map_err(serde::ser::Error::custom)?;
+    if let Some(blocks) = value["blocks"].as_array_mut() {
+        for block in blocks {
+            if let Some(marks) = block["marks"].as_array_mut() {
+                for mark in marks {
+                    if let Some(fields) = mark.as_object_mut() {
+                        fields.retain(|key, value| !match key.as_str() {
+                            "bold" | "italic" => value.as_bool() == Some(false),
+                            "link" => value.is_null(),
+                            _ => false,
+                        });
+                    }
+                }
+            }
+            if let Some(fields) = block.as_object_mut() {
+                fields.retain(|key, value| !match key.as_str() {
+                    "text" | "caption" | "alt" => value.as_str() == Some(""),
+                    "marks" => value.as_array().is_some_and(Vec::is_empty),
+                    "asset" => value.is_null(),
+                    "width" => value.as_u64() == Some(100),
+                    _ => false,
+                });
+            }
+        }
+    }
+    value.serialize(serializer)
+}
+
+fn content_size(content: &Value) -> Result<usize, String> {
+    serde_json::to_vec(content).map(|bytes| bytes.len()).map_err(|e| e.to_string())
+}
+
+fn remove_html_fallback(content: &mut Value) {
+    if let Some(fields) = content.as_object_mut() {
+        fields.remove("format");
+        fields.remove("formatted_body");
+    }
+}
+
 pub fn wire_content(
     doc: &Document,
     version: u64,
     assets: &BTreeMap<String, RemoteAsset>,
     root: Option<&ruma::EventId>,
+    transaction_id: Option<&str>,
+    encrypted: bool,
 ) -> Result<Value, String> {
     doc.ready()?;
+    if transaction_id.is_some_and(|id| !valid_id(id)) {
+        return Err("Invalid publication transaction".into());
+    }
     let mut html = format!(
         "<h1>{}</h1><p>{}</p>",
         escape(&doc.title),
@@ -139,22 +195,36 @@ pub fn wire_content(
     let article = ArticleContent {
         schema: 2,
         version,
-        transaction_id: None,
+        transaction_id: transaction_id.map(str::to_owned),
         document: doc.clone(),
         assets: assets.clone(),
     };
     let mut content = json!({"msgtype":"m.text","body":plain,"format":"org.matrix.custom.html","formatted_body":html,"m.mentions":{},ARTICLE_KEY:article});
+    if content_size(&content[ARTICLE_KEY])? > ARTICLE_DATA_LIMIT {
+        return Err("This article is too large to send. Shorten it and try again.".into());
+    }
     if let Some(root) = root {
         let new = content.clone();
+        // Only m.new_content carries the authoritative article on an edit.
+        // Legacy clients still get the complete text/HTML fallback outside it.
+        content.as_object_mut().unwrap().remove(ARTICLE_KEY);
         content["body"] = json!(format!("* {}", content["body"].as_str().unwrap_or("")));
+        content["formatted_body"] = json!(format!("* {}", content["formatted_body"].as_str().unwrap_or("")));
         content["m.new_content"] = new;
         content["m.relates_to"] = json!({"rel_type":"m.replace","event_id":root});
     }
-    if serde_json::to_vec(&content)
-        .map_err(|e| e.to_string())?
-        .len()
-        > 58_000
-    {
+    let limit = if encrypted { ENCRYPTED_CONTENT_LIMIT } else { PLAIN_CONTENT_LIMIT };
+    if content_size(&content)? > limit {
+        // Generated HTML is optional in Matrix. Keep the complete plain text
+        // and lossless native document instead of truncating the user's post.
+        remove_html_fallback(&mut content);
+    }
+    if content_size(&content)? > limit {
+        if let Some(new) = content.get_mut("m.new_content") {
+            remove_html_fallback(new);
+        }
+    }
+    if content_size(&content)? > limit {
         return Err("This article is too large to send. Shorten it and try again.".into());
     }
     Ok(content)
@@ -481,18 +551,7 @@ pub async fn execute(
     {
         return Err("Chat encryption changed. Review the publication again.".into());
     }
-    let mut content = wire_content(&op.document, op.version, &op.uploaded, op.root.as_deref())?;
-    content[ARTICLE_KEY]["transaction_id"] = json!(op.id);
-    if let Some(new_content) = content.get_mut("m.new_content") {
-        new_content[ARTICLE_KEY]["transaction_id"] = json!(op.id);
-    }
-    if serde_json::to_vec(&content)
-        .map_err(|e| e.to_string())?
-        .len()
-        > 58_000
-    {
-        return Err("This article is too large to send. Shorten it and try again.".into());
-    }
+    let content = wire_content(&op.document, op.version, &op.uploaded, op.root.as_deref(), Some(&op.id), encryption_now)?;
     guard(&client, &grant)?;
     let event = if let Some(id) = op.confirmed.clone() {
         id
@@ -699,11 +758,130 @@ pub async fn download_image(
 #[cfg(test)]
 mod tests {
     use super::*;
+    async fn encrypt_and_decrypt(wire: &Value) -> Value {
+        // Use real SDK Megolm encryption, with long IDs, but no server/account.
+        let room = ruma::RoomId::parse(format!("!{}:example.org", "r".repeat(242))).unwrap();
+        let machine = matrix_sdk_crypto::OlmMachine::new(
+            ruma::user_id!("@article-test:example.org"),
+            ruma::device_id!("ARTICLE_TEST"),
+        ).await;
+        machine.share_room_key(&room, std::iter::empty(), matrix_sdk_crypto::EncryptionSettings::default())
+            .await.unwrap();
+        let encrypted = machine.encrypt_room_event_raw(
+            &room, "m.room.message", &ruma::serde::Raw::new(wire).unwrap().cast_unchecked(),
+        ).await.unwrap();
+        let bytes = encrypted.content.json().get().len();
+        println!("article payload: {} bytes; encrypted content: {bytes} bytes", content_size(wire).unwrap());
+        // The encrypted content must leave room for the server's full event.
+        assert!(bytes + 4096 <= 65_536, "encrypted content exceeds Matrix event budget: {bytes}");
+        let event = json!({
+            "event_id": "$article:example.org", "origin_server_ts": 1,
+            "sender": machine.user_id(), "type": "m.room.encrypted", "content": encrypted.content,
+        });
+        let decrypted = machine.decrypt_room_event(
+            &ruma::serde::Raw::new(&event).unwrap().cast_unchecked(), &room,
+            &matrix_sdk_crypto::DecryptionSettings {
+                sender_device_trust_requirement: matrix_sdk_crypto::TrustRequirement::Untrusted,
+            },
+        ).await.unwrap();
+        let event: Value = serde_json::from_str(decrypted.event.json().get()).unwrap();
+        event["content"].clone()
+    }
+
+    #[tokio::test]
+    async fn editor_markdown_fits_after_matrix_encryption() {
+        let source = include_str!("../../lab/article-editor/render-comparison/source.md");
+        let doc = Document::from_markdown("Markdown 格式测试", source).unwrap();
+        let stored = serde_json::to_vec(&doc).unwrap();
+        let transaction = "r".repeat(100);
+        for root in [None, Some(ruma::event_id!("$original"))] {
+            let version = if root.is_some() { 2 } else { 1 };
+            let wire = wire_content(&doc, version, &BTreeMap::new(), root, Some(&transaction), true).unwrap();
+            assert!(content_size(&wire).unwrap() <= ENCRYPTED_CONTENT_LIMIT);
+            let received = encrypt_and_decrypt(&wire).await;
+            let article = ArticleContent::parse(&received).unwrap();
+            assert_eq!(article.document, doc);
+            assert_eq!(article.document.markdown(), source);
+            assert_eq!(article.transaction_id.as_deref(), Some(transaction.as_str()));
+            assert_eq!(article.version, version);
+            let new = received.get("m.new_content").unwrap_or(&received);
+            assert!(new["body"].as_str().unwrap().contains("End"));
+            assert!(new["body"].as_str().unwrap().contains("多语言代码高亮"));
+            // The compact representation still works in schema 2 readers.
+            let legacy: Document = serde_json::from_value(new[ARTICLE_KEY]["document"].clone()).unwrap();
+            assert_eq!(legacy, doc);
+            if root.is_some() {
+                assert!(wire.get(ARTICLE_KEY).is_none());
+                assert_eq!(received["m.relates_to"]["event_id"], "$original");
+            }
+        }
+        assert_eq!(serde_json::to_vec(&doc).unwrap(), stored);
+    }
+
+    #[tokio::test]
+    async fn encryption_budget_leaves_room_for_megolm_and_event_metadata() {
+        let mut wire = json!({"msgtype": "m.text", "body": "",
+            "m.relates_to": {"rel_type": "m.replace", "event_id": format!("${}", "e".repeat(254))}});
+        wire["body"] = json!("x".repeat(ENCRYPTED_CONTENT_LIMIT - content_size(&wire).unwrap()));
+        assert_eq!(content_size(&wire).unwrap(), ENCRYPTED_CONTENT_LIMIT);
+        assert_eq!(encrypt_and_decrypt(&wire).await, wire);
+    }
+
+    #[test]
+    fn compact_wire_keeps_non_default_formatting_and_original_source_hash() {
+        let mut doc = Document::from_markdown("Rich", "**bold** *italic* [link](https://example.org)").unwrap();
+        doc.blocks[0].width = 75;
+        doc.blocks[0].caption = "Caption".into();
+        doc.blocks[0].alt = "Alt".into();
+        let original_hash = doc.imported_source.as_ref().unwrap().blocks_hash.clone();
+        let wire = wire_content(&doc, 1, &BTreeMap::new(), None, Some("retry-123"), true).unwrap();
+        let document = &wire[ARTICLE_KEY]["document"];
+        assert!(document["blocks"][0].get("asset").is_none());
+        assert_eq!(document["blocks"][0]["width"], 75);
+        let restored = ArticleContent::parse(&wire).unwrap().document;
+        assert_eq!(restored, doc);
+        assert_eq!(restored.imported_source.unwrap().blocks_hash, original_hash);
+        // Publications from older versions containing all defaults still read.
+        let mut old = wire.clone();
+        old[ARTICLE_KEY]["document"] = serde_json::to_value(&doc).unwrap();
+        assert_eq!(ArticleContent::parse(&old).unwrap().document, doc);
+        old["m.new_content"] = wire;
+        assert_eq!(ArticleContent::parse(&old).unwrap().document, doc);
+    }
+
+    #[test]
+    fn large_articles_keep_complete_plain_text_without_html_duplication() {
+        let source = "中文 👩‍💻 & \"quoted\" \\ tail\n".repeat(400);
+        let doc = Document { title: "Large".into(),
+            blocks: vec![Block::new(BlockKind::Paragraph, &source)], ..Document::default() };
+        let plain = wire_content(&doc, 1, &BTreeMap::new(), None, None, false).unwrap();
+        let encrypted = wire_content(&doc, 1, &BTreeMap::new(), None, Some("retry"), true).unwrap();
+        assert!(plain.get("formatted_body").is_some());
+        assert!(encrypted.get("formatted_body").is_none());
+        assert!(encrypted.get("format").is_none());
+        assert_eq!(plain["body"], encrypted["body"]);
+        assert_eq!(ArticleContent::parse(&encrypted).unwrap().document, doc);
+        assert!(content_size(&encrypted).unwrap() <= ENCRYPTED_CONTENT_LIMIT);
+    }
+
+    #[test]
+    fn oversized_articles_are_rejected_without_truncation() {
+        let source = "中\"\\".repeat(9000);
+        let doc = Document { title: "Large".into(),
+            blocks: vec![Block::new(BlockKind::Paragraph, &source)], ..Document::default() };
+        for root in [None, Some(ruma::event_id!("$original"))] {
+            for encrypted in [false, true] {
+                assert!(wire_content(&doc, 1, &BTreeMap::new(), root, Some("retry"), encrypted)
+                    .unwrap_err().contains("too large"));
+            }
+        }
+        assert_eq!(doc.blocks[0].text, source);
+    }
     #[test]
     fn updates_reference_original_and_remain_readable() {
         let doc = Document::from_markdown("文章", "**你好**").unwrap();
         let root = ruma::event_id!("$original");
-        let wire = wire_content(&doc, 2, &BTreeMap::new(), Some(root)).unwrap();
+        let wire = wire_content(&doc, 2, &BTreeMap::new(), Some(root), None, true).unwrap();
         assert_eq!(wire["m.relates_to"]["event_id"], root.as_str());
         assert_eq!(wire["msgtype"], "m.text");
         assert!(wire["m.new_content"]["formatted_body"]
@@ -715,7 +893,7 @@ mod tests {
     #[test]
     fn operation_marker_is_optional_but_bounded() {
         let doc = Document::from_markdown("A", "hello").unwrap();
-        let mut wire = wire_content(&doc, 1, &BTreeMap::new(), None).unwrap();
+        let mut wire = wire_content(&doc, 1, &BTreeMap::new(), None, None, true).unwrap();
         assert!(ArticleContent::parse(&wire)
             .unwrap()
             .transaction_id
@@ -748,13 +926,13 @@ mod tests {
         };
         let mut assets = BTreeMap::new();
         assets.insert(id.clone(), remote);
-        assert!(ArticleContent::parse(&wire_content(&doc, 1, &assets, None).unwrap()).is_err());
+        assert!(ArticleContent::parse(&wire_content(&doc, 1, &assets, None, None, true).unwrap()).is_err());
         let mut block = Block::new(BlockKind::Image, "");
         block.asset = Some(id.clone());
         doc.blocks.push(block);
-        assert!(ArticleContent::parse(&wire_content(&doc, 1, &assets, None).unwrap()).is_ok());
+        assert!(ArticleContent::parse(&wire_content(&doc, 1, &assets, None, None, true).unwrap()).is_ok());
         assets.get_mut(&id).unwrap().asset.width = 0;
-        assert!(ArticleContent::parse(&wire_content(&doc, 1, &assets, None).unwrap()).is_err());
+        assert!(ArticleContent::parse(&wire_content(&doc, 1, &assets, None, None, true).unwrap()).is_err());
     }
     #[test]
     fn hostile_article_and_local_paths_rejected() {
@@ -763,6 +941,6 @@ mod tests {
         let mut b = Block::new(BlockKind::Image, "");
         b.asset = Some("../../secret".into());
         doc.blocks.push(b);
-        assert!(wire_content(&doc, 1, &BTreeMap::new(), None).is_err());
+        assert!(wire_content(&doc, 1, &BTreeMap::new(), None, None, true).is_err());
     }
 }

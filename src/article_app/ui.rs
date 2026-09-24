@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use article_core::editing::EditHistory;
 use article_makepad::body_selection::{ArticleSelection, SelectionUpdate};
+use makepad_widgets::{makepad_draw::text::selection::{Cursor, Selection}, text_input::UndoGroup};
 use article_makepad::content::Images as PreviewImages;
 #[cfg(feature = "html_preview")]
 use makepad_html_renderer::makepad::HtmlViewWidgetExt;
@@ -36,6 +37,8 @@ enum Page {
     Consent,
     Library,
     Edit,
+    /// The Markdown writing view: full-document source with a live preview (huasheng-style).
+    Write,
     Source,
     Images,
     ImageSettings,
@@ -110,6 +113,19 @@ script_mod! {
     mod.widgets.ArticleInput = TextInput {width: Fill height: 44 draw_bg +: {color: #xffffff color_hover: #xffffff color_focus: #xffffff color_empty: #xffffff border_color: #xe5e5e5 border_color_focus: #x07c160} draw_text +: {color: #x191919 color_focus: #x191919 color_hover: #x191919 text_style: theme.font_regular{font_size: 14}}}
     mod.widgets.ArticleHtml = Html {selectable: true width: Fill height: Fit padding: 0 font_size: 14 font_color: #x191919 draw_text.color: #x191919 text_style_normal: theme.font_regular{font_size: 14} text_style_bold: theme.font_bold{font_size: 14} text_style_italic: theme.font_italic{font_size: 14} text_style_bold_italic: theme.font_bold_italic{font_size: 14} rmath := ArticleMath {} rdiagram := ArticleDiagram {} rimage := ArticleImage {} remoji := ArticleEmoji {} rcode := ArticleCode {} rcell := ArticleCell {}}
     mod.widgets.ArticleRich = ArticleRichInput {width: Fill height: Fit is_multiline: true flow: Flow.Right{wrap: true} padding: Inset{top: 4 bottom: 12 left: 0 right: 0} empty_text: #(crate::i18n::tr("Write your article…")) draw_bg +: {color: #x00000000 color_hover: #x00000000 color_focus: #x00000000 color_down: #x00000000 color_empty: #x00000000 border_size: 0} draw_text +: {color: #x191919 color_hover: #x191919 color_focus: #x191919 text_style: theme.font_regular{font_size: 14}} draw_bold.text_style: theme.font_bold{font_size: 14} draw_italic.text_style: theme.font_italic{font_size: 14} draw_bold_italic.text_style: theme.font_bold_italic{font_size: 14}}
+    mod.widgets.ArticleTool = mod.widgets.ArticleButton {width: 34 height: 32 padding: 0 align: Align{x: 0.5 y: 0.5} draw_bg +: {color: #x00000000 color_hover: #xf0f0f0 color_down: #xe6e6e6 border_size: 0}}
+    // A compact theme swatch for the writing view's style panel: a tiny page with the
+    // theme's paper, ink and accent, and the theme's name below.
+    mod.widgets.ArticleThemeSwatch = NavigationBarButton {width: Fill height: Fill flow: Down align: Align{x: 0.5 y: 0.0} padding: 0 spacing: 6
+        draw_bg +: {color: #x00000000 color_hover: #x00000000 color_active: #x00000000}
+        page := RoundedView {width: Fill height: 72 flow: Down padding: 9 spacing: 6 draw_bg +: {color: #xffffff border_size: 1.0 border_color: #xe0e0e0 border_radius: 4.0}
+            heading := SolidView {width: 34 height: 3}
+            line1 := SolidView {width: Fill height: 2}
+            line2 := SolidView {width: Fill height: 2}
+            accent := SolidView {width: Fill height: 3}
+        }
+        name := mod.widgets.ArticleLabel {width: Fit padding: 0 draw_text.text_style: theme.font_regular{font_size: 11}}
+    }
     mod.widgets.ArticleThemeTile = NavigationBarButton {width: Fill height: 210 flow: Down align: Align{x: 0.0 y: 0.0} padding: 12 spacing: 8
         draw_bg +: {color: instance(#xffffff) border_size: 1.0 border_color: #xe0e0e0 get_color: fn() {return self.color}}
         name := mod.widgets.ArticleLabel {padding: 0 max_lines: 1 draw_text.text_style: theme.font_bold{font_size: 11}}
@@ -123,7 +139,23 @@ script_mod! {
         padding: Inset{top: mod.widgets.SAFE_INSET_PAD_TOP + #(TOP) bottom: mod.widgets.SAFE_INSET_PAD_BOTTOM}
         header := SolidView {width: Fill height: 52 flow: Right align: Align{y: 0.5} padding: Inset{left: 8 right: 12} spacing: 8 draw_bg.color: #xededed
             article_back := RobrixNeutralIconButton {width: 36 height: 44 padding: 12 spacing: 0 draw_bg +: {color: #x00000000 color_hover: #x00000000 color_down: #x00000000 border_size: 0} draw_icon +: {svg: ICON_CHEVRON_LEFT color: #x191919} icon_walk: Walk{width: 8 height: 14}}
-            article_heading := mod.widgets.ArticleLabel {width: Fill max_lines: 1 draw_text.text_style: theme.font_bold{font_size: 16}}
+            article_heading := mod.widgets.ArticleLabel {width: Fit max_lines: 1 draw_text.text_style: theme.font_bold{font_size: 16}}
+            header_fill := View {width: Fill height: Fill}
+            // The writing view's article title, centred in the header as in the atlas.
+            write_title_box := View {visible: false width: Fill height: Fill align: Align{x: 0.5 y: 0.5}
+                write_title := mod.widgets.ArticleInput {width: 300 height: 40 empty_text: #(crate::i18n::tr("Article title")) i18n_empty_text: "Article title" draw_text.text_style: theme.font_bold{font_size: 15} draw_bg +: {border_size: 0 color: #x00000000 color_empty: #x00000000 color_hover: #x00000000 color_focus: #xf5f5f5 color_down: #x00000000}}
+            }
+            // Writing view controls, as in the redesigned editor atlas.
+            write_controls := View {visible: false width: Fit height: Fill flow: Right align: Align{y: 0.5} spacing: 8
+                write_style := mod.widgets.ArticleButton {height: 32 draw_text +: {color: #x07a858} draw_bg +: {border_size: 1.0 border_color: #x9fdcb8}}
+                RoundedView {width: Fit height: 32 flow: Right padding: 2 spacing: 0 draw_bg +: {color: #xffffff border_radius: 6.0}
+                    write_mode_source := mod.widgets.ArticleButton {height: 28 text: #(crate::i18n::tr("Edit")) i18n_text: "Edit" draw_bg +: {border_radius: 5}}
+                    write_mode_split := mod.widgets.ArticleButton {height: 28 text: #(crate::i18n::tr("Split")) i18n_text: "Split" draw_bg +: {border_radius: 5}}
+                    write_mode_preview := mod.widgets.ArticleButton {height: 28 text: #(crate::i18n::tr("Preview")) i18n_text: "Preview" draw_bg +: {border_radius: 5}}
+                }
+                write_saved := mod.widgets.ArticleLabel {width: Fit draw_text +: {color: #x888888 text_style: theme.font_regular{font_size: 11}}}
+                write_publish := mod.widgets.ArticlePrimary {width: Fit height: 32 padding: Inset{left: 16 right: 16} text: #(crate::i18n::tr("Publish")) i18n_text: "Publish"}
+            }
             article_save := mod.widgets.ArticleButton {text: #(crate::i18n::tr("Save")) i18n_text: "Save" visible: false}
             article_done := mod.widgets.ArticleButton {visible: false text: #(crate::i18n::tr("Done")) i18n_text: "Done" draw_text.color: #x07a858}
             article_close := mod.widgets.ArticleButton {text: #(crate::i18n::tr("Close")) i18n_text: "Close"}
@@ -230,6 +262,84 @@ script_mod! {
                 View {width: Fill height: Fill}
                 inspector_preview := mod.widgets.ArticlePrimary {text: #(crate::i18n::tr("Full preview")) i18n_text: "Full preview"}
             }
+        }
+        writer := View {visible: false width: Fill height: Fill flow: Down
+            View {width: Fill height: Fill flow: Right
+                write_source_pane := SolidView {width: Fill height: Fill flow: Overlay draw_bg.color: #xffffff
+                    View {width: Fill height: Fill flow: Down
+                        // Phone width: the title is edited here rather than in the header.
+                        write_title_small_box := View {visible: false width: Fill height: 60 padding: Inset{left: 12 right: 12 top: 12}
+                            write_title_small := mod.widgets.ArticleInput {height: Fill empty_text: #(crate::i18n::tr("Article title")) i18n_empty_text: "Article title" draw_text.text_style: theme.font_bold{font_size: 16}}
+                        }
+                        write_toolbar := View {width: Fill height: 40 flow: Right align: Align{y: 0.5} padding: Inset{left: 10 right: 10} spacing: 0
+                            wt_bold := mod.widgets.ArticleTool {text: "B"  draw_text.text_style: theme.font_bold{font_size: 13}}
+                            wt_italic := mod.widgets.ArticleTool {text: "I"  draw_text.text_style: theme.font_italic{font_size: 13}}
+                            wt_heading := mod.widgets.ArticleTool {text: "H"  draw_text.text_style: theme.font_bold{font_size: 13}}
+                            wt_quote := mod.widgets.ArticleTool {text: "❝" }
+                            wt_bullet := mod.widgets.ArticleTool {text: "•" }
+                            wt_numbered := mod.widgets.ArticleTool {text: "1." }
+                            wt_link := mod.widgets.ArticleTool {width: Fit padding: Inset{left: 8 right: 8} text: #(crate::i18n::tr("Link")) i18n_text: "Link"}
+                            wt_image := mod.widgets.ArticleTool {width: Fit padding: Inset{left: 8 right: 8} text: #(crate::i18n::tr("Image")) i18n_text: "Image"}
+                            wt_code := mod.widgets.ArticleTool {text: "</>" width: 40}
+                            wt_table := mod.widgets.ArticleTool {text: "⊞" }
+                            wt_rule := mod.widgets.ArticleTool {text: "—" }
+                        }
+                        SolidView {width: Fill height: 1 draw_bg.color: #xe5e5e5}
+                        write_source := mod.widgets.ArticleInput {height: Fill is_multiline: true flow: Flow.Right{wrap: true} padding: Inset{left: 16 right: 16 top: 12 bottom: 12} empty_text: #(crate::i18n::tr("Write Markdown here…")) i18n_empty_text: "Write Markdown here…" draw_text +: {text_style: theme.font_regular{font_size: 13 line_spacing: 1.5}} draw_bg +: {border_size: 0 color_focus: #xffffff}}
+                        // Phone width: formatting within thumb reach, as in the mobile atlas.
+                        write_bottom := View {visible: false width: Fill height: Fit flow: Down padding: Inset{left: 12 right: 12 bottom: 8} spacing: 6
+                            write_saved_small := mod.widgets.ArticleLabel {draw_text +: {color: #x999999 text_style: theme.font_regular{font_size: 11}}}
+                            RoundedView {width: Fill height: 44 flow: Right align: Align{x: 0.5 y: 0.5} padding: Inset{left: 6 right: 6} draw_bg +: {color: #xffffff border_size: 1.0 border_color: #xe5e5e5 border_radius: 6.0}
+                                wb_bold := mod.widgets.ArticleTool {width: Fill text: "B" draw_text.text_style: theme.font_bold{font_size: 14}}
+                                wb_italic := mod.widgets.ArticleTool {width: Fill text: "I" draw_text.text_style: theme.font_italic{font_size: 14}}
+                                wb_heading := mod.widgets.ArticleTool {width: Fill text: "H" draw_text.text_style: theme.font_bold{font_size: 14}}
+                                wb_quote := mod.widgets.ArticleTool {width: Fill text: "❝"}
+                                wb_bullet := mod.widgets.ArticleTool {width: Fill text: "•"}
+                                wb_image := mod.widgets.ArticleTool {width: Fill text: #(crate::i18n::tr("Image")) i18n_text: "Image"}
+                                wb_link := mod.widgets.ArticleTool {width: Fill text: #(crate::i18n::tr("Link")) i18n_text: "Link"}
+                            }
+                        }
+                    }
+                    // Shown while image files are dragged over the source pane.
+                    write_drop := RoundedView {visible: false width: Fill height: Fill margin: 10 flow: Down align: Align{x: 0.5 y: 0.5} spacing: 8
+                        draw_bg +: {color: #xe9f8ef border_size: 2.0 border_color: #x07c160 border_radius: 10.0}
+                        write_drop_title := Label {draw_text +: {color: #x07a858 text_style: theme.font_bold{font_size: 18}}}
+                        Label {text: #(crate::i18n::tr("Compressed automatically · saved on this device")) i18n_text: "Compressed automatically · saved on this device" draw_text +: {color: #x888888 text_style: theme.font_regular{font_size: 12}}}
+                    }
+                }
+                write_divider := SolidView {width: 1 height: Fill draw_bg.color: #xe5e5e5}
+                write_preview_pane := SolidView {width: Fill height: Fill flow: Down align: Align{x: 0.5} padding: Inset{top: 16 bottom: 16} draw_bg.color: #xf5f5f5
+                    write_paper := RoundedView {width: 420 height: Fill flow: Down padding: Inset{left: 24 right: 24 top: 24 bottom: 8} draw_bg +: {color: #xffffff border_size: 1.0 border_color: #xe8e8e8 border_radius: 4.0}
+                        write_list := PortalList {width: Fill height: Fill
+                            Title := View {width: Fill height: Fit padding: Inset{bottom: 16}
+                                write_preview_title := mod.widgets.ArticleLabel {draw_text.text_style: theme.font_bold{font_size: 22}}
+                            }
+                            Text := View {width: Fill height: Fit flow: Down padding: Inset{bottom: 12} body := mod.widgets.ArticleHtml {}}
+                            // Consecutive images laid out as a tight grid, like WeChat/huasheng.
+                            Gallery := View {width: Fill height: Fit flow: Down spacing: 3 padding: Inset{bottom: 12}
+                                row0 := View {width: Fill height: 120 flow: Right spacing: 3 g0 := Image {width: Fill height: Fill fit: ImageFit.CropToFill} g1 := Image {width: Fill height: Fill fit: ImageFit.CropToFill} g2 := Image {width: Fill height: Fill fit: ImageFit.CropToFill}}
+                                row1 := View {width: Fill height: 120 flow: Right spacing: 3 g3 := Image {width: Fill height: Fill fit: ImageFit.CropToFill} g4 := Image {width: Fill height: Fill fit: ImageFit.CropToFill} g5 := Image {width: Fill height: Fill fit: ImageFit.CropToFill}}
+                                row2 := View {width: Fill height: 120 flow: Right spacing: 3 g6 := Image {width: Fill height: Fill fit: ImageFit.CropToFill} g7 := Image {width: Fill height: Fill fit: ImageFit.CropToFill} g8 := Image {width: Fill height: Fill fit: ImageFit.CropToFill}}
+                            }
+                        }
+                    }
+                }
+                write_themes_panel := SolidView {visible: false width: 320 height: Fill flow: Down padding: 16 spacing: 10 draw_bg.color: #xffffff
+                    View {width: Fill height: 32 flow: Right align: Align{y: 0.5}
+                        mod.widgets.ArticleLabel {width: Fill text: #(crate::i18n::tr("Article style")) i18n_text: "Article style" draw_text.text_style: theme.font_bold{font_size: 14}}
+                        write_themes_close := mod.widgets.ArticleButton {text: "×" width: 32 height: 32}
+                    }
+                    write_theme_list := PortalList {width: Fill height: Fill
+                        Swatches := View {width: Fill height: 108 flow: Right spacing: 10 padding: Inset{bottom: 12}
+                            t0 := mod.widgets.ArticleThemeSwatch {}
+                            t1 := mod.widgets.ArticleThemeSwatch {}
+                            t2 := mod.widgets.ArticleThemeSwatch {}
+                        }
+                    }
+                }
+            }
+            SolidView {width: Fill height: 1 draw_bg.color: #xe5e5e5}
+            write_stats := mod.widgets.ArticleLabel {padding: Inset{left: 16 top: 8 bottom: 8} draw_text +: {color: #x888888 text_style: theme.font_regular{font_size: 11}}}
         }
         source := View {visible: false width: Fill height: Fill flow: Down padding: 18 spacing: 12
             mod.widgets.ArticleLabel {text: #(crate::i18n::tr("Markdown / HTML source · your theme and cover are preserved")) i18n_text: "Markdown / HTML source · your theme and cover are preserved"}
@@ -443,6 +553,45 @@ pub struct ArticlePanel {
     image_bindings: ImageBindings,
     #[rust]
     remote_article: Option<ArticleContent>,
+    /// Use the older block editor instead of the Markdown writing view.
+    #[rust] block_mode: bool,
+    #[rust] write_mode: WriteMode,
+    /// The document whose source is loaded into `write_source`.
+    #[rust] write_loaded: Option<String>,
+    #[rust] write_preview: Vec<article_core::markdown_render::RenderedBlock>,
+    #[rust] write_preview_key: String,
+    /// Debounces re-rendering the live preview while typing.
+    #[rust] write_timer: Timer,
+    #[rust] write_themes_open: bool,
+    #[rust] write_dragging: bool,
+    /// Whether the live preview shows the title above the body: not when the source
+    /// already opens with a level-1 heading, which would repeat it.
+    #[rust] write_title_row: bool,
+}
+
+/// The rendered image ids of a block that holds only images (at least two), such as
+/// `![](a) ![](b) ![](c)` on one line; such blocks are drawn as a gallery grid.
+fn gallery_images(html: &str) -> Option<Vec<String>> {
+    let mut ids = Vec::new();
+    let mut rest = html.trim();
+    for tag in ["<p>", "</p>"] { rest = rest.trim_start_matches(tag).trim_end_matches(tag); }
+    let mut rest = rest.trim();
+    while let Some(after) = rest.strip_prefix("<rimage>") {
+        let end = after.find("</rimage>")?;
+        ids.push(after[..end].split(':').next()?.to_owned());
+        rest = after[end + "</rimage>".len()..].trim_start_matches(|c: char| c.is_whitespace() || c == '\u{a0}');
+        rest = rest.trim_start_matches("<br>").trim_start_matches("<br/>").trim_start();
+    }
+    (rest.is_empty() && ids.len() >= 2).then_some(ids)
+}
+
+/// What the writing view shows: the Markdown source, both side by side, or the preview.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum WriteMode {
+    Source,
+    #[default]
+    Split,
+    Preview,
 }
 impl ArticlePanel {
     fn navigate_anchor(&mut self,cx:&mut Cx,fragment:&str) {
@@ -456,6 +605,360 @@ impl ArticlePanel {
             self.portal_list(cx,if editing {ids!(article_blocks)}else{ids!(article_reader)}).set_first_id_and_scroll(index+cover,0.0);
             self.redraw(cx);
         }
+    }
+    /// Applies full-document Markdown/HTML source to the document, keeping its theme,
+    /// cover and image settings, and saves it. The source is then the document's own.
+    fn apply_source(&mut self, cx: &mut Cx, text: &str) -> Result<(), String> {
+        let mut state = super::model::Draft {
+            title: self.doc.title.clone(),
+            markdown: String::new(),
+        };
+        super::model::apply_input(&mut state, "markdown_changed", text)?;
+        let doc = if self.doc.is_html_source() {
+            Document::from_html(&state.title, &state.markdown)
+        } else {
+            Document::from_markdown(&state.title, &state.markdown)
+        }?;
+        let mut blocks = doc.blocks;
+        let mut matched_images = std::collections::HashSet::new();
+        for block in &mut blocks {
+            if block.kind == BlockKind::Image {
+                if let Some((index, old)) = self.doc.blocks.iter().enumerate().find(|(index, old)| {
+                    !matched_images.contains(index) && old.kind == BlockKind::Image && old.asset == block.asset
+                }) {
+                    matched_images.insert(index);
+                    block.id = old.id.clone();
+                    block.caption = old.caption.clone();
+                    block.width = old.width;
+                }
+            }
+        }
+        // Commit the import and source removal before navigating:
+        // opening the image library can reload storage immediately.
+        // A failed write must leave both editing forms intact.
+        let mut imported = self.doc.clone();
+        imported.blocks = blocks;
+        imported.reference_definitions = doc.reference_definitions;
+        imported.retain_source(&state.markdown);
+        imported.modified = now();
+        let grant = self.grant.as_ref().ok_or("Authorization expired")?;
+        storage::save_document_with_source(crate::app_data_dir(), grant, &imported, None)?;
+        self.checkpoint();
+        self.doc = imported;
+        self.library.clear_source(&self.doc.id);
+        self.dirty = false;
+        self.operation = None;
+        cx.stop_timer(self.save_timer);
+        Ok(())
+    }
+    /// Fills a Gallery row with up to nine images in a tight grid of square cells:
+    /// two or four images use two columns, others three.
+    fn draw_gallery(&self, cx: &mut Cx, row: &WidgetRef, ids: &[String]) {
+        const GAP: f64 = 3.0;
+        let count = ids.len().min(9);
+        let columns = if matches!(count, 2 | 4) { 2 } else { 3 };
+        let inner = if self.viewport_width >= 960.0 { 420.0 - 48.0 } else { self.viewport_width - 48.0 };
+        let side = ((inner - GAP * (columns - 1) as f64) / columns as f64).floor().max(40.0);
+        let cells = [id!(g0), id!(g1), id!(g2), id!(g3), id!(g4), id!(g5), id!(g6), id!(g7), id!(g8)];
+        for (r, row_id) in [id!(row0), id!(row1), id!(row2)].into_iter().enumerate() {
+            let line = row.view(cx, &[row_id]);
+            line.set_visible(cx, r * columns < count);
+            if let Some(mut view) = line.borrow_mut() { view.walk.height = Size::Fixed(side); }
+            for c in 0..3 {
+                let image = line.image(cx, &[cells[r * 3 + c]]);
+                let index = r * columns + c;
+                // Cells beyond the column count are hidden; so are empty trailing cells,
+                // which keep their share of the row (see the widths below).
+                image.set_visible(cx, c < columns);
+                let Some(id) = ids.get(index).filter(|_| c < columns && index < count) else {
+                    image.set_visible(cx, false);
+                    continue;
+                };
+                if self.image_bindings.borrow().get(&image.widget_uid()).is_some_and(|key| key == id) { continue; }
+                if let Some(preview) = self.preview_images.values().find(|p| &p.id == id) {
+                    if image.load_image_from_data(cx, &preview.png).is_ok() {
+                        self.image_bindings.borrow_mut().insert(image.widget_uid(), id.clone());
+                    }
+                }
+            }
+            // Keep columns aligned in a partly filled row: fixed cell widths.
+            for c in 0..3 {
+                let image = line.image(cx, &[cells[r * 3 + c]]);
+                if let Some(mut inner_image) = image.borrow_mut() { inner_image.walk.width = Size::Fixed(side); }
+            }
+        }
+    }
+    /// Shows the writing view's panes for the current mode and window width,
+    /// and renders the live preview of the current source.
+    fn layout_writer(&mut self, cx: &mut Cx2d, wide: bool) {
+        // Narrow windows (mobile) switch between editing and previewing; split needs room.
+        let mode = match self.write_mode {
+            WriteMode::Split if !wide => WriteMode::Source,
+            mode => mode,
+        };
+        let source = mode != WriteMode::Preview;
+        let preview = mode != WriteMode::Source;
+        self.view(cx, ids!(write_source_pane)).set_visible(cx, source);
+        self.view(cx, ids!(write_preview_pane)).set_visible(cx, preview);
+        self.view(cx, ids!(write_divider)).set_visible(cx, source && preview);
+        self.view(cx, ids!(write_themes_panel)).set_visible(cx, self.write_themes_open && wide);
+        self.button(cx, ids!(write_mode_split)).set_visible(cx, wide);
+        // Phone width follows the mobile atlas: back, 编辑|预览 and 发布 in the header;
+        // title above the source; formatting at the bottom; no stats while editing.
+        self.label(cx, ids!(article_heading)).set_visible(cx, wide);
+        self.button(cx, ids!(write_style)).set_visible(cx, wide);
+        self.label(cx, ids!(write_saved)).set_visible(cx, wide);
+        self.view(cx, ids!(write_title_box)).set_visible(cx, wide);
+        self.view(cx, ids!(header_fill)).set_visible(cx, !wide);
+        self.view(cx, ids!(write_title_small_box)).set_visible(cx, !wide);
+        self.view(cx, ids!(write_toolbar)).set_visible(cx, wide);
+        self.view(cx, ids!(write_bottom)).set_visible(cx, !wide);
+        self.label(cx, ids!(write_stats)).set_visible(cx, wide || mode == WriteMode::Preview);
+        let paper_width = if wide { Size::Fixed(420.0) } else { Size::fill() };
+        let (paper, _, accent) = self.doc.theme.colors();
+        let paper = color(paper);
+        let mut sheet = self.view(cx, ids!(write_paper));
+        script_apply_eval!(cx, sheet, {width: #(paper_width) draw_bg +: {color: #(paper)}});
+        for (id, selected) in [(id!(write_mode_source), mode == WriteMode::Source), (id!(write_mode_split), mode == WriteMode::Split), (id!(write_mode_preview), mode == WriteMode::Preview)] {
+            let mut button = self.button(cx, &[id]);
+            let (bg, ink) = if selected { (color(0xe9f8ef), color(0x07a858)) } else { (color(0xffffff), color(0x555555)) };
+            script_apply_eval!(cx, button, {draw_bg +: {color: #(bg)} draw_text +: {color: #(ink) color_hover: #(ink)}});
+        }
+        let style = format!("{}：{}", tr("Style"), tr(self.doc.theme.name()));
+        self.button(cx, ids!(write_style)).set_text(cx, &style);
+        let accent = color(accent);
+        let mut style_button = self.button(cx, ids!(write_style));
+        script_apply_eval!(cx, style_button, {draw_text +: {color: #(accent) color_hover: #(accent)}});
+        let saved = tr(if self.dirty { "Editing…" } else { "Saved" });
+        self.label(cx, ids!(write_saved)).set_text(cx, saved);
+        self.label(cx, ids!(write_saved_small)).set_text(cx, saved);
+        if preview {
+            let text = self.text_input(cx, ids!(write_source)).text();
+            self.prepare_write_preview(&text);
+        }
+    }
+    /// Loads the document's source into the writing view.
+    fn load_write_source(&mut self, cx: &mut Cx) {
+        let source = self.library.source_for(&self.doc.id).map(str::to_owned).unwrap_or_else(|| self.doc.markdown());
+        self.text_input(cx, ids!(write_source)).set_text(cx, &source);
+        self.text_input(cx, ids!(write_title)).set_text(cx, &self.doc.title);
+        self.text_input(cx, ids!(write_title_small)).set_text(cx, &self.doc.title);
+        self.write_loaded = Some(self.doc.id.clone());
+        self.write_preview_key.clear();
+        self.portal_list(cx, ids!(write_list)).set_first_id_and_scroll(0, 0.0);
+    }
+    /// Saves the writing view: applies its source into the document when it is valid,
+    /// otherwise keeps it as a source draft. Returns false if nothing could be saved.
+    fn flush_write(&mut self, cx: &mut Cx) -> bool {
+        if !self.dirty { return true; }
+        let text = self.text_input(cx, ids!(write_source)).text();
+        match self.apply_source(cx, &text) {
+            Ok(()) => {
+                self.status(cx, "Draft saved on this device");
+                self.refresh_document(cx);
+                self.ensure_preview_images();
+                true
+            }
+            // Unsupported or invalid source stays a draft, exactly as typed.
+            Err(_) => self.save(cx),
+        }
+    }
+    /// Records an edit of the writing view's source.
+    fn write_changed(&mut self, cx: &mut Cx, text: String) {
+        self.library.source_drafts.insert(self.doc.id.clone(), text);
+        self.doc.modified = now();
+        self.dirty = true;
+        self.operation = None;
+        cx.stop_timer(self.save_timer);
+        self.save_timer = cx.start_timeout(0.7);
+        cx.stop_timer(self.write_timer);
+        self.write_timer = cx.start_timeout(0.25);
+        self.status(cx, "Unsaved changes");
+    }
+    /// Replaces the selection in the source with `text` (or inserts it at the cursor).
+    fn insert_write_text(&mut self, cx: &mut Cx, text: &str) {
+        let input = self.text_input(cx, ids!(write_source));
+        let selection = input.selection();
+        let range = selection.start().index..selection.end().index;
+        let _ = input.replace_range(cx, range.clone(), text, UndoGroup::New);
+        let end = range.start + text.len();
+        input.set_selection(cx, Selection {
+            anchor: Cursor { index: end, prefer_next_row: false },
+            cursor: Cursor { index: end, prefer_next_row: false },
+        });
+        let text = input.text();
+        self.write_changed(cx, text);
+    }
+    /// Wraps the selection in `before`/`after`, or inserts `placeholder` wrapped and selected.
+    fn wrap_write_selection(&mut self, cx: &mut Cx, before: &str, after: &str, placeholder: &str) {
+        let input = self.text_input(cx, ids!(write_source));
+        let selection = input.selection();
+        let (start, end) = (selection.start().index, selection.end().index);
+        let inner = if start == end { tr(placeholder).to_string() } else { input.selected_text() };
+        let _ = input.replace_range(cx, start..end, &format!("{before}{inner}{after}"), UndoGroup::New);
+        let inner_start = start + before.len();
+        input.set_selection(cx, Selection {
+            anchor: Cursor { index: inner_start, prefer_next_row: false },
+            cursor: Cursor { index: inner_start + inner.len(), prefer_next_row: false },
+        });
+        let text = input.text();
+        self.write_changed(cx, text);
+    }
+    /// Adds `prefix` at the start of every line the selection touches.
+    fn prefix_write_lines(&mut self, cx: &mut Cx, prefix: impl Fn(usize) -> String) {
+        let input = self.text_input(cx, ids!(write_source));
+        let text = input.text();
+        let selection = input.selection();
+        let start = text[..selection.start().index].rfind('\n').map_or(0, |i| i + 1);
+        let end = text[selection.end().index..].find('\n').map_or(text.len(), |i| selection.end().index + i);
+        let lines: Vec<String> = text[start..end].split('\n').enumerate().map(|(i, line)| format!("{}{line}", prefix(i))).collect();
+        let replaced = lines.join("\n");
+        let _ = input.replace_range(cx, start..end, &replaced, UndoGroup::New);
+        let caret = Cursor { index: start + replaced.len(), prefer_next_row: false };
+        input.set_selection(cx, Selection { anchor: caret, cursor: caret });
+        let text = input.text();
+        self.write_changed(cx, text);
+    }
+    fn set_write_mode(&mut self, cx: &mut Cx, mode: WriteMode) {
+        self.write_mode = mode;
+        self.view.redraw(cx);
+    }
+    fn handle_write_actions(&mut self, cx: &mut Cx, actions: &Actions) {
+        if let Some(text) = self.text_input(cx, ids!(write_source)).changed(actions) {
+            self.write_changed(cx, text);
+        }
+        if let Some(title) = self.text_input(cx, ids!(write_title)).changed(actions) {
+            self.text_input(cx, ids!(write_title_small)).set_text(cx, &title);
+            self.doc.title = title;
+            self.changed(cx);
+        }
+        if let Some(title) = self.text_input(cx, ids!(write_title_small)).changed(actions) {
+            self.text_input(cx, ids!(write_title)).set_text(cx, &title);
+            self.doc.title = title;
+            self.changed(cx);
+        }
+        for (id, before, after, placeholder) in [
+            (id!(wt_bold), "**", "**", "bold text"),
+            (id!(wb_bold), "**", "**", "bold text"),
+            (id!(wt_italic), "*", "*", "italic text"),
+            (id!(wb_italic), "*", "*", "italic text"),
+            (id!(wt_code), "`", "`", "code"),
+            (id!(wt_link), "[", "](https://)", "link text"),
+            (id!(wb_link), "[", "](https://)", "link text"),
+        ] {
+            if self.button(cx, &[id]).clicked(actions) { self.wrap_write_selection(cx, before, after, placeholder); }
+        }
+        if self.button(cx, ids!(wt_heading)).clicked(actions) || self.button(cx, ids!(wb_heading)).clicked(actions) { self.prefix_write_lines(cx, |_| "## ".into()); }
+        if self.button(cx, ids!(wt_quote)).clicked(actions) || self.button(cx, ids!(wb_quote)).clicked(actions) { self.prefix_write_lines(cx, |_| "> ".into()); }
+        if self.button(cx, ids!(wt_bullet)).clicked(actions) || self.button(cx, ids!(wb_bullet)).clicked(actions) { self.prefix_write_lines(cx, |_| "- ".into()); }
+        if self.button(cx, ids!(wt_numbered)).clicked(actions) { self.prefix_write_lines(cx, |i| format!("{}. ", i + 1)); }
+        if self.button(cx, ids!(wt_rule)).clicked(actions) { self.insert_write_text(cx, "\n\n---\n\n"); }
+        if self.button(cx, ids!(wt_table)).clicked(actions) {
+            self.insert_write_text(cx, "\n\n| 列 1 | 列 2 |\n| --- | --- |\n|  |  |\n\n");
+        }
+        if self.button(cx, ids!(wt_image)).clicked(actions) || self.button(cx, ids!(wb_image)).clicked(actions) {
+            self.selecting_cover = false;
+            self.replacing_image = false;
+            self.pick(cx);
+        }
+        for (id, mode) in [(id!(write_mode_source), WriteMode::Source), (id!(write_mode_split), WriteMode::Split), (id!(write_mode_preview), WriteMode::Preview)] {
+            if self.button(cx, &[id]).clicked(actions) { self.set_write_mode(cx, mode); }
+        }
+        if self.button(cx, ids!(write_style)).clicked(actions) {
+            self.write_themes_open = !self.write_themes_open;
+            self.view.redraw(cx);
+        }
+        if self.button(cx, ids!(write_themes_close)).clicked(actions) {
+            self.write_themes_open = false;
+            self.view.redraw(cx);
+        }
+        for (index, item) in self.portal_list(cx, ids!(write_theme_list)).items_with_actions(actions) {
+            for (offset, id) in [id!(t0), id!(t1), id!(t2)].into_iter().enumerate() {
+                if item.navigation_bar_button(cx, &[id]).clicked(actions) {
+                    if let Some(t) = Theme::ALL.get(index * 3 + offset) {
+                        self.checkpoint();
+                        self.doc.theme = *t;
+                        self.changed(cx);
+                    }
+                }
+            }
+        }
+        if self.button(cx, ids!(write_publish)).clicked(actions) && self.flush_write(cx) {
+            self.review(cx);
+        }
+    }
+    /// Accepts image files dragged onto the source pane and imports them at the cursor.
+    fn handle_write_drop(&mut self, cx: &mut Cx, event: &Event) {
+        fn images(items: &[DragItem]) -> Vec<String> {
+            items.iter().filter_map(|item| match item {
+                DragItem::FilePath { path, internal_id: None } => {
+                    let lower = path.to_lowercase();
+                    [".png", ".jpg", ".jpeg"].iter().any(|ext| lower.ends_with(ext)).then(|| path.clone())
+                }
+                _ => None,
+            }).collect()
+        }
+        // The pane itself draws nothing, so hit-test the source input that fills it.
+        let area = self.text_input(cx, ids!(write_source)).area();
+        match event.drag_hits(cx, area) {
+            DragHit::Drag(hit) if hit.state == DragState::Out => self.write_drop_ended(cx),
+            DragHit::Drag(hit) => {
+                let count = images(&hit.items).len();
+                if count > 0 {
+                    *hit.response.lock().unwrap() = DragResponse::Copy;
+                    if !self.write_dragging {
+                        self.write_dragging = true;
+                        self.label(cx, ids!(write_drop_title)).set_text(cx, &tr("Release to insert {0} images").replace("{0}", &count.to_string()));
+                        self.view(cx, ids!(write_drop)).set_visible(cx, true);
+                        self.view.redraw(cx);
+                    }
+                }
+            }
+            DragHit::Drop(hit) => {
+                self.write_drop_ended(cx);
+                let paths = images(&hit.items);
+                let Some(grant) = self.grant.clone() else { return };
+                for path in paths {
+                    let grant = grant.clone();
+                    let document = self.doc.id.clone();
+                    spawn_async_task(async move {
+                        let path = std::path::PathBuf::from(path);
+                        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("image").to_owned();
+                        let result = storage::import_image(crate::app_data_dir(), &grant, &path, &name);
+                        Cx::post_action(ResultAction::Image { instance: grant.instance, document, cover: false, result });
+                    });
+                }
+            }
+            DragHit::DragEnd => self.write_drop_ended(cx),
+            DragHit::NoHit => if matches!(event, Event::Drag(_)) { self.write_drop_ended(cx) },
+        }
+    }
+    fn write_drop_ended(&mut self, cx: &mut Cx) {
+        if self.write_dragging {
+            self.write_dragging = false;
+            self.view(cx, ids!(write_drop)).set_visible(cx, false);
+            self.view.redraw(cx);
+        }
+    }
+    /// Renders the live preview of the writing view's current source.
+    fn prepare_write_preview(&mut self, source: &str) {
+        let key = format!("{}:{}:{:?}:{}:{}", self.doc.id, blake3::hash(source.as_bytes()), self.doc.theme, self.doc.large_type, self.preview_images.len());
+        if key == self.write_preview_key { return; }
+        let mut images = (*self.preview_images).clone();
+        for id in source.split("asset:").skip(1).map(|rest| rest.chars().take_while(|c| c.is_ascii_hexdigit()).collect::<String>()) {
+            let key = format!("asset:{id}");
+            if id.is_empty() || images.contains_key(&key) { continue; }
+            let bytes = self.reader_assets.get(&id).cloned().or_else(|| self.grant.as_ref().and_then(|g| storage::asset_bytes(crate::app_data_dir(), g, &id).ok()));
+            if let Some(image) = bytes.and_then(|b| article_makepad::content::prepare_image(&b).ok()) { images.insert(key, image); }
+        }
+        for (url, id) in &self.doc.resource_bindings {
+            if let Some(image) = images.get(&format!("asset:{id}")).cloned() { images.insert(url.clone(), image); }
+        }
+        self.preview_images = std::sync::Arc::new(images);
+        let mut renderer = article_makepad::content::NativeRenderer { images: &self.preview_images, size: if self.doc.large_type { 16.0 } else { 14.0 }, ink: self.doc.theme.colors().1 };
+        self.write_preview = article_core::markdown_render::render(source, &mut renderer);
+        self.write_title_row = !source.trim_start().starts_with("# ");
+        self.write_preview_key = key;
     }
     fn prepare_native_preview(&mut self) {
         if self.doc.is_html_source() && self.page!=Page::Edit { return; }
@@ -530,7 +1033,11 @@ impl ArticlePanel {
         }));
     }
     fn status(&self, cx: &mut Cx, s: &str) {
-        self.label(cx, ids!(article_status)).set_text(cx, tr(s));
+        let label = self.label(cx, ids!(article_status));
+        label.set_text(cx, tr(s));
+        // The writing view shows its save state in the header; keep other messages.
+        let routine = s.is_empty() || matches!(s, "Draft saved on this device" | "Unsaved changes");
+        label.set_visible(cx, self.page != Page::Write || !routine);
     }
     fn source_report(&self, cx: &mut Cx, source: &str) {
         use article_core::markdown::{inspect, Effect, Feature};
@@ -673,10 +1180,25 @@ impl ArticlePanel {
             self.pending = false;
             self.html_view(cx, ids!(css_preview_bitmap)).clear(cx);
         }
+        let page = if page == Page::Edit && !self.block_mode { Page::Write } else { page };
+        if page == Page::Write && (self.page != Page::Write || self.write_loaded.as_deref() != Some(self.doc.id.as_str())) {
+            self.load_write_source(cx);
+        }
         self.page = page;
         self.native_preview_key.clear();
         self.reader_select_all=false;
-        if matches!(page, Page::Edit | Page::Preview | Page::Reader) { self.ensure_preview_images(); }
+        if matches!(page, Page::Edit | Page::Write | Page::Preview | Page::Reader) { self.ensure_preview_images(); }
+        let writing = page == Page::Write;
+        self.label(cx, ids!(article_heading)).set_visible(cx, true);
+        self.view(cx, ids!(write_controls)).set_visible(cx, writing);
+        self.view(cx, ids!(write_title_box)).set_visible(cx, writing);
+        self.view(cx, ids!(header_fill)).set_visible(cx, !writing);
+        self.button(cx, ids!(article_close)).set_visible(cx, !writing);
+        // The writing view hides the heading at phone width; other pages always show it.
+        self.label(cx, ids!(article_heading)).set_visible(cx, true);
+        let header_bg = color(if writing { 0xffffff } else { 0xededed });
+        let mut header = self.view(cx, ids!(header));
+        script_apply_eval!(cx, header, {draw_bg +: {color: #(header_bg)}});
         self.button(cx, ids!(article_done)).set_visible(
             cx,
             matches!(page, Page::Theme | Page::Cover | Page::ImageSettings),
@@ -686,6 +1208,7 @@ impl ArticlePanel {
             (id!(consent), Page::Consent),
             (id!(library), Page::Library),
             (id!(editor), Page::Edit),
+            (id!(writer), Page::Write),
             (id!(source), Page::Source),
             (id!(images), Page::Images),
             (id!(image_settings), Page::ImageSettings),
@@ -710,6 +1233,7 @@ impl ArticlePanel {
             Page::Consent => "Authorize app",
             Page::Library => "Article studio",
             Page::Edit => "Edit article",
+            Page::Write => "Article editor",
             Page::Source => "Markdown / HTML source",
             Page::Images => "Insert images",
             Page::ImageSettings => "Image settings",
@@ -760,6 +1284,8 @@ impl ArticlePanel {
         );
         self.label(cx, ids!(article_stats)).set_text(cx, &stats);
         self.label(cx, ids!(preview_stats)).set_text(cx, &stats);
+        let grouped = chars.to_string().as_bytes().rchunks(3).rev().map(|c| std::str::from_utf8(c).unwrap()).collect::<Vec<_>>().join(",");
+        self.label(cx, ids!(write_stats)).set_text(cx, &crate::i18n::format("{0} chars · about {1} min · {2} images", &[("0", grouped), ("1", minutes.to_string()), ("2", images.to_string())]));
         self.label(cx, ids!(preview_title))
             .set_text(cx, &self.doc.title);
         self.label(cx, ids!(preview_author))
@@ -928,6 +1454,10 @@ impl ArticlePanel {
             });
             self.changed(cx);
             self.open_cover(cx);
+        } else if !self.block_mode && !self.replacing_image {
+            let alt = asset.name.replace(['[', ']'], "");
+            self.insert_write_text(cx, &format!("![{alt}](asset:{})", asset.id));
+            self.show(cx, Page::Edit);
         } else {
             if self.replacing_image {
                 if let Some(b) = self.doc.blocks.get_mut(self.active_block) {
@@ -1256,6 +1786,12 @@ impl ArticlePanel {
                     self.show(cx, Page::Library)
                 }
             }
+            Page::Write => {
+                if self.flush_write(cx) {
+                    self.load_library(cx);
+                    self.show(cx, Page::Library)
+                }
+            }
             Page::Source => {
                 if self.save(cx) {
                     self.show(cx, Page::Edit);
@@ -1336,8 +1872,12 @@ impl Widget for ArticlePanel {
             self.body_selection.after_event(cx, &list, &self.doc);
         }
         if self.save_timer.is_event(event).is_some() && self.dirty && !self.pending {
-            self.save(cx);
+            if self.page == Page::Write { self.flush_write(cx); } else { self.save(cx); }
         }
+        if self.write_timer.is_event(event).is_some() && self.page == Page::Write {
+            self.view.redraw(cx);
+        }
+        if self.page == Page::Write { self.handle_write_drop(cx, event); }
         if let Event::Actions(actions) = event {
             for action in actions {
                 if matches!(self.page, Page::Edit | Page::Preview | Page::Reader) {
@@ -1950,61 +2490,16 @@ impl Widget for ArticlePanel {
             }
             if self.page == Page::Source && self.button(cx, ids!(source_apply)).clicked(actions) {
                 let text = self.text_input(cx, ids!(article_markdown)).text();
-                let mut state = super::model::Draft {
-                    title: self.doc.title.clone(),
-                    markdown: String::new(),
-                };
-                let result = super::model::apply_input(&mut state, "markdown_changed", &text)
-                    .and_then(|()| if self.doc.is_html_source() {
-                        Document::from_html(&state.title, &state.markdown)
-                    } else {
-                        Document::from_markdown(&state.title, &state.markdown)
-                    });
-                match result {
-                    Ok(mut doc) => {
-                        let mut matched_images = std::collections::HashSet::new();
-                        for block in &mut doc.blocks {
-                            if block.kind == BlockKind::Image {
-                                if let Some((index, old)) =
-                                    self.doc.blocks.iter().enumerate().find(|(index, old)| {
-                                        !matched_images.contains(index)
-                                            && old.kind == BlockKind::Image
-                                            && old.asset == block.asset
-                                    })
-                                {
-                                    matched_images.insert(index);
-                                    block.id = old.id.clone();
-                                    block.caption = old.caption.clone();
-                                    block.width = old.width;
-                                }
-                            }
-                        }
-                        // Commit the import and source removal before navigating:
-                        // opening the image library can reload storage immediately.
-                        // A failed write must leave both editing forms intact.
-                        let mut imported = self.doc.clone();
-                        imported.blocks = doc.blocks;
-                        imported.reference_definitions = doc.reference_definitions;
-                        imported.retain_source(&state.markdown);
-                        imported.modified = now();
-                        let Some(grant) = &self.grant else { return };
-                        if let Err(error) = storage::save_document_with_source(
-                            crate::app_data_dir(), grant, &imported, None,
-                        ) {
-                            self.status(cx, &error);
-                            return;
-                        }
-                        self.checkpoint();
-                        self.doc = imported;
-                        self.library.clear_source(&self.doc.id);
-                        self.dirty = false;
-                        self.operation = None;
-                        cx.stop_timer(self.save_timer);
+                match self.apply_source(cx, &text) {
+                    Ok(()) => {
                         self.bind(cx);
                         self.show(cx, Page::Edit);
                     }
                     Err(e) => self.status(cx, &e),
                 }
+            }
+            if self.page == Page::Write {
+                self.handle_write_actions(cx, actions);
             }
             if self.page == Page::Images {
                 if self.button(cx, ids!(image_pick)).clicked(actions) {
@@ -2308,12 +2803,15 @@ impl Widget for ArticlePanel {
         self.view(cx, ids!(editor_sidebar)).set_visible(cx, wide);
         self.view(cx, ids!(editor_inspector)).set_visible(cx, wide);
         if matches!(self.page,Page::Edit|Page::Preview|Page::Reader) {self.prepare_native_preview();}
+        if self.page == Page::Write { self.layout_writer(cx, wide); }
         while let Some(item) = self.view.draw_walk(cx, scope, walk).step() {
             let uid = item.widget_uid();
             let library = uid == self.portal_list(cx, ids!(article_library)).widget_uid();
             let blocks = uid == self.portal_list(cx, ids!(article_blocks)).widget_uid();
             let reader = uid == self.portal_list(cx, ids!(article_reader)).widget_uid();
             let themes = uid == self.portal_list(cx, ids!(theme_list)).widget_uid();
+            let swatches = uid == self.portal_list(cx, ids!(write_theme_list)).widget_uid();
+            let writing = uid == self.portal_list(cx, ids!(write_list)).widget_uid();
             let images = uid == self.portal_list(cx, ids!(image_library)).widget_uid();
             if let Some(mut list) = item.borrow_mut::<PortalList>() {
                 let cover = self.doc.cover.as_ref().filter(|c| c.show_in_article);
@@ -2324,7 +2822,11 @@ impl Widget for ArticlePanel {
                 } else if reader {
                     (if self.doc.is_html_source(){self.doc.blocks.len()}else{self.native_preview.len()}) + usize::from(cover.is_some())
                 } else if themes {
-                    2
+                    Theme::ALL.len().div_ceil(2)
+                } else if writing {
+                    usize::from(self.write_title_row) + self.write_preview.len()
+                } else if swatches {
+                    Theme::ALL.len().div_ceil(3)
                 } else if images {
                     self.library.assets.len()
                 } else {
@@ -2518,10 +3020,61 @@ impl Widget for ArticlePanel {
                         cx.global::<article_makepad::content_view::DrawingImages>().0 = self.preview_images.clone();
                         row.draw_all(cx, &mut Scope::empty());
                         cx.global::<article_makepad::content_view::DrawingImages>().0 = Default::default();
+                    } else if swatches {
+                        let row = list.item(cx, index, id!(Swatches));
+                        for (offset, id) in [id!(t0), id!(t1), id!(t2)].into_iter().enumerate() {
+                            let swatch = row.widget(cx, &[id]);
+                            let Some(&theme) = Theme::ALL.get(index * 3 + offset) else { swatch.set_visible(cx, false); continue };
+                            swatch.set_visible(cx, true);
+                            let selected = theme == self.doc.theme;
+                            let (paper, ink, accent) = theme.colors();
+                            let (paper, ink, accent) = (color(paper), color(ink), color(accent));
+                            let mut faint = ink; faint.w = 0.35;
+                            let border = if selected { accent } else { color(0xe0e0e0) };
+                            let name_ink = if selected { accent } else { color(0x333333) };
+                            swatch.label(cx, ids!(name)).set_text(cx, tr(theme.name()));
+                            let mut page = swatch.view(cx, ids!(page));
+                            script_apply_eval!(cx, page, {draw_bg +: {color: #(paper) border_color: #(border) border_size: #(if selected {2.0} else {1.0})}});
+                            let mut heading = swatch.view(cx, ids!(heading));
+                            script_apply_eval!(cx, heading, {draw_bg +: {color: #(ink)}});
+                            for id in [id!(line1), id!(line2)] {
+                                let mut line = swatch.view(cx, &[id]);
+                                script_apply_eval!(cx, line, {draw_bg +: {color: #(faint)}});
+                            }
+                            let mut bar = swatch.view(cx, ids!(accent));
+                            script_apply_eval!(cx, bar, {draw_bg +: {color: #(accent)}});
+                            let mut name = swatch.label(cx, ids!(name));
+                            script_apply_eval!(cx, name, {draw_text +: {color: #(name_ink)}});
+                        }
+                        row.draw_all(cx, &mut Scope::empty());
+                        continue;
+                    } else if writing {
+                        let index = if self.write_title_row { index } else { index + 1 };
+                        if index == 0 {
+                            let row = list.item(cx, index, id!(Title));
+                            let ink = color(self.doc.theme.colors().1);
+                            let mut title = row.label(cx, ids!(write_preview_title));
+                            title.set_text(cx, &self.doc.title);
+                            script_apply_eval!(cx, title, {draw_text +: {color: #(ink)}});
+                            row.draw_all(cx, &mut Scope::empty());
+                        } else if let Some(ids) = self.write_preview.get(index - 1).and_then(|b| gallery_images(&b.html)) {
+                            let row = list.item(cx, index, id!(Gallery));
+                            self.draw_gallery(cx, &row, &ids);
+                            row.draw_all(cx, &mut Scope::empty());
+                        } else if let Some(block) = self.write_preview.get(index - 1) {
+                            let row = list.item(cx, index, id!(Text));
+                            let mut html = row.html(cx, ids!(body));
+                            article_makepad::presentation::style_html(cx, html.clone(), &self.doc);
+                            html.set_text(cx, &article_makepad::content::native_html(&block.html));
+                            cx.global::<article_makepad::content_view::DrawingImages>().0 = self.preview_images.clone();
+                            row.draw_all(cx, &mut Scope::empty());
+                            cx.global::<article_makepad::content_view::DrawingImages>().0 = Default::default();
+                        }
+                        continue;
                     } else if themes {
                         let row = list.item(cx, index, id!(Theme));
                         for (offset, id) in [id!(left), id!(right)].into_iter().enumerate() {
-                            let theme = Theme::ALL[index * 2 + offset];
+                            let Some(&theme) = Theme::ALL.get(index * 2 + offset) else { continue };
                             let mut tile = row.widget(cx, &[id]);
                             tile.label(cx, ids!(name)).set_text(
                                 cx,

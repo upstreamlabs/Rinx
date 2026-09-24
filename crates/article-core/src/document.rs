@@ -26,23 +26,52 @@ pub enum Theme {
     Paper,
     Ocean,
     Ink,
+    Magazine,
+    NewYorkTimes,
+    FinancialTimes,
+    Minimal,
+    Tech,
+    Longform,
+    Elegant,
+    DeepReading,
 }
 impl Theme {
-    pub const ALL: [Self; 4] = [Self::Classic, Self::Paper, Self::Ocean, Self::Ink];
+    pub const ALL: [Self; 12] = [
+        Self::Classic, Self::Paper, Self::Ocean, Self::Ink,
+        Self::Magazine, Self::NewYorkTimes, Self::FinancialTimes, Self::Minimal,
+        Self::Tech, Self::Longform, Self::Elegant, Self::DeepReading,
+    ];
     pub fn name(self) -> &'static str {
         match self {
             Self::Classic => "Classic green",
             Self::Paper => "Warm paper",
             Self::Ocean => "Ocean blue",
             Self::Ink => "Minimal ink",
+            Self::Magazine => "Magazine",
+            Self::NewYorkTimes => "New York Times",
+            Self::FinancialTimes => "Financial Times",
+            Self::Minimal => "Minimal",
+            Self::Tech => "Tech",
+            Self::Longform => "Longform",
+            Self::Elegant => "Elegant",
+            Self::DeepReading => "Deep reading",
         }
     }
+    /// (paper, ink, accent) colors.
     pub fn colors(self) -> (u32, u32, u32) {
         match self {
             Self::Classic => (0xffffff, 0x191919, 0x07a858),
             Self::Paper => (0xfaf5eb, 0x443d32, 0x987550),
             Self::Ocean => (0xf4f9fc, 0x263c4b, 0x398cba),
             Self::Ink => (0xffffff, 0x202020, 0x353535),
+            Self::Magazine => (0xffffff, 0x1a1a1a, 0xc0392b),
+            Self::NewYorkTimes => (0xffffff, 0x121212, 0x326891),
+            Self::FinancialTimes => (0xfff1e5, 0x33302e, 0x990f3d),
+            Self::Minimal => (0xffffff, 0x333333, 0x888888),
+            Self::Tech => (0xf7f9fc, 0x1f2937, 0x2563eb),
+            Self::Longform => (0xfdfdfb, 0x2b2b2b, 0x7a5c3e),
+            Self::Elegant => (0xfbf8f3, 0x3a3230, 0xb08d57),
+            Self::DeepReading => (0xf8f6f1, 0x2d2a26, 0x5b6b4f),
         }
     }
 }

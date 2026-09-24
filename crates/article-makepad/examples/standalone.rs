@@ -151,7 +151,7 @@ impl MatchEvent for App {
             }
         }
         if self.ui.button(cx, ids!(theme)).clicked(actions) {
-            let next = (Theme::ALL.iter().position(|t| *t == self.document.theme).unwrap_or(0) + 1) % 4;
+            let next = (Theme::ALL.iter().position(|t| *t == self.document.theme).unwrap_or(0) + 1) % Theme::ALL.len();
             self.document.theme = Theme::ALL[next];
         }
         if self.ui.button(cx, ids!(save)).clicked(actions) {
