@@ -87,6 +87,7 @@ async fn post(
         event_type: "m.room.message".into(),
         content: model::post_content(text, &[]),
         is_post: true,
+        draft_body: Some(text.into()),
         paths,
         assets: vec![],
         confirmed: None,
@@ -206,7 +207,7 @@ async fn palpo_moments_recipient_encryption_and_native_seed() -> Result<()> {
         }checks.push("ordered_album_attachments_decrypt_and_match_original_bytes");
         let delayed=photo.with_file_name("delayed-upload.png");let _=std::fs::remove_file(&delayed);
         let timeline=alice.validate(&room).await?;
-        let upload=Pending{transaction:TransactionId::new(),room:room.clone(),audience:timeline.audience,event_type:"m.room.message".into(),content:model::post_content("Recovered album upload",&[]),is_post:true,paths:vec![photo.clone(),delayed.clone()],assets:vec![],confirmed:None};
+        let upload=Pending{transaction:TransactionId::new(),room:room.clone(),audience:timeline.audience,event_type:"m.room.message".into(),content:model::post_content("Recovered album upload",&[]),is_post:true,draft_body:Some("Recovered album upload".into()),paths:vec![photo.clone(),delayed.clone()],assets:vec![],confirmed:None};
         ensure!(alice.send(upload).await.is_err());let saved=alice.pending()?.unwrap();ensure!(saved.assets.len()==1);
         let first_upload=saved.assets[0].file.url.clone();std::fs::copy(&photo,&delayed)?;
         let resumed=Service::for_test(alice.client.clone());let retry=resumed.send(resumed.pending()?.unwrap()).await?;
@@ -228,7 +229,7 @@ async fn palpo_moments_recipient_encryption_and_native_seed() -> Result<()> {
         let removed_viewer_can_fetch_ciphertext=wire(&bob.client,&room,&after).await.is_ok();
         checks.push("removed_viewer_with_old_keys_cannot_decrypt_future_post_on_either_device");
         // An old audience fingerprint is rejected and retained for explicit review.
-        let stale=Pending{transaction:TransactionId::new(),room:room.clone(),audience:"stale audience".into(),event_type:"m.room.message".into(),content:model::post_content("Reviewed audience draft",&[]),is_post:true,paths:vec![],assets:vec![],confirmed:None};
+        let stale=Pending{transaction:TransactionId::new(),room:room.clone(),audience:"stale audience".into(),event_type:"m.room.message".into(),content:model::post_content("Reviewed audience draft",&[]),is_post:true,draft_body:Some("Reviewed audience draft".into()),paths:vec![],assets:vec![],confirmed:None};
         ensure!(alice.send(stale.clone()).await.is_err());ensure!(alice.pending()?.unwrap().transaction==stale.transaction);
         ensure!(alice.review_pending(&room,"stale").await.is_err());
         let reviewed=alice.validate(&room).await?;alice.review_pending(&room,&reviewed.audience).await?;alice.send(alice.pending()?.unwrap()).await?;checks.push("audience_change_blocks_saved_draft_until_explicit_review");

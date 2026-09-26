@@ -19,6 +19,7 @@ use super::{
 // Mutations are ordered within a process. Cross-device creation is reconciled
 // against joined rooms and duplicates require an explicit timeline choice.
 static WRITES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static REPLY_DRAFT_WRITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Preferences {
@@ -51,6 +52,76 @@ impl Default for Preferences {
 pub struct ComposerDraft {
     pub body: String,
     pub paths: Vec<PathBuf>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplyDraftKey {
+    pub room: OwnedRoomId,
+    pub post: OwnedEventId,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ReplyDraft {
+    key: ReplyDraftKey,
+    body: String,
+}
+#[derive(Debug, Serialize, Deserialize)]
+struct ReplyDrafts {
+    version: u8,
+    drafts: Vec<ReplyDraft>,
+}
+impl Default for ReplyDrafts {
+    fn default() -> Self { Self { version: 1, drafts: Vec::new() } }
+}
+impl ReplyDrafts {
+    fn get(&self, key: &ReplyDraftKey) -> String {
+        self.drafts.iter().find(|draft| &draft.key == key)
+            .map_or_else(String::new, |draft| draft.body.clone())
+    }
+    fn set(&mut self, key: &ReplyDraftKey, body: &str) -> bool {
+        if self.get(key) == body { return false; }
+        self.drafts.retain(|draft| &draft.key != key);
+        if !body.is_empty() { self.drafts.push(ReplyDraft { key: key.clone(), body: body.into() }); }
+        true
+    }
+    fn clear_if_matches(&mut self, key: &ReplyDraftKey, body: &str) -> bool {
+        let before = self.drafts.len();
+        self.drafts.retain(|draft| &draft.key != key || draft.body != body);
+        self.drafts.len() != before
+    }
+}
+fn read_reply_drafts(path: &Path) -> Result<ReplyDrafts> {
+    if !path.exists() { return Ok(ReplyDrafts::default()); }
+    let drafts: ReplyDrafts = serde_json::from_slice(&std::fs::read(path)?)?;
+    ensure!(drafts.version == 1, "Unsupported Moments reply draft version");
+    Ok(drafts)
+}
+pub fn reply_draft(owner: &ruma::UserId, key: &ReplyDraftKey) -> Result<String> {
+    let _lock = REPLY_DRAFT_WRITES.lock().unwrap();
+    let path = crate::persistence::persistent_state_dir(owner).join("moments-replies.json");
+    Ok(read_reply_drafts(&path)?.get(key))
+}
+pub fn save_reply_draft(owner: &ruma::UserId, key: &ReplyDraftKey, body: &str) -> Result<()> {
+    let _lock = REPLY_DRAFT_WRITES.lock().unwrap();
+    let path = crate::persistence::persistent_state_dir(owner).join("moments-replies.json");
+    let mut drafts = read_reply_drafts(&path)?;
+    if drafts.set(key, body) { write_private(&path, &drafts)?; }
+    Ok(())
+}
+pub fn clear_reply_draft_if_matches(owner: &ruma::UserId, key: &ReplyDraftKey, body: &str) -> Result<()> {
+    let _lock = REPLY_DRAFT_WRITES.lock().unwrap();
+    let path = crate::persistence::persistent_state_dir(owner).join("moments-replies.json");
+    if !path.exists() { return Ok(()); }
+    let mut drafts = read_reply_drafts(&path)?;
+    if drafts.clear_if_matches(key, body) { write_private(&path, &drafts)?; }
+    Ok(())
+}
+pub fn pending_reply_draft(pending: &Pending) -> Option<(ReplyDraftKey, String)> {
+    if pending.event_type != "m.room.message" || pending.content.pointer("/m.relates_to/rel_type")?.as_str()? != "m.thread" {
+        return None;
+    }
+    Some((ReplyDraftKey {
+        room: pending.room.clone(),
+        post: OwnedEventId::try_from(pending.content.pointer("/m.relates_to/event_id")?.as_str()?).ok()?,
+    }, pending.content.get("body")?.as_str()?.to_owned()))
 }
 #[derive(Clone, Debug)]
 pub struct Member {
@@ -615,6 +686,31 @@ impl Service {
         }
         Ok(Some(serde_json::from_slice(&std::fs::read(path)?)?))
     }
+    fn cleanup_sent_post(&self, pending: &Pending) {
+        let draft_path = self.path("moments-composer.json");
+        let draft = std::fs::read(&draft_path).ok()
+            .and_then(|bytes| serde_json::from_slice::<ComposerDraft>(&bytes).ok());
+        let matches_sent = draft.as_ref().is_some_and(|draft| {
+            draft.paths == pending.paths
+                && pending.draft_body.as_deref().map_or_else(
+                    || draft.body == pending.content["body"].as_str().unwrap_or("")
+                        || (draft.body.is_empty() && !draft.paths.is_empty()),
+                    |original| draft.body == original,
+                )
+        });
+        if matches_sent {
+            let _ = std::fs::remove_file(&draft_path);
+        }
+        let retained_paths = draft.as_ref().map(|draft| &draft.paths);
+        let staged = self.path("moments-drafts");
+        for path in &pending.paths {
+            if path.starts_with(&staged)
+                && (!draft_path.exists()
+                    || retained_paths.is_some_and(|paths| !paths.contains(path))) {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
     pub async fn send(&self, mut pending: Pending) -> Result<OwnedEventId> {
         let _lock = WRITES.lock().await;
         self.guard()?;
@@ -628,7 +724,8 @@ impl Service {
                 pending = previous;
             }
         }
-        if let Some(id) = pending.confirmed {
+        if let Some(id) = pending.confirmed.clone() {
+            if pending.is_post { self.cleanup_sent_post(&pending); }
             return Ok(id);
         }
         ensure!(
@@ -733,25 +830,7 @@ impl Service {
         };
         pending.confirmed = Some(sent.response.event_id.clone());
         self.save_pending(&pending)?;
-        if pending.is_post {
-            let draft_path = self.path("moments-composer.json");
-            if let Ok(bytes) = std::fs::read(&draft_path) {
-                if let Ok(draft) = serde_json::from_slice::<ComposerDraft>(&bytes) {
-                    if draft.paths == pending.paths
-                        && (draft.body == pending.content["body"].as_str().unwrap_or("")
-                            || (draft.body.is_empty() && !draft.paths.is_empty()))
-                    {
-                        let _ = std::fs::remove_file(draft_path);
-                    }
-                }
-            }
-            let staged = self.path("moments-drafts");
-            for path in &pending.paths {
-                if path.starts_with(&staged) {
-                    let _ = std::fs::remove_file(path);
-                }
-            }
-        }
+        if pending.is_post { self.cleanup_sent_post(&pending); }
         Ok(sent.response.event_id)
     }
     pub fn save_pending(&self, pending: &Pending) -> Result<()> {
@@ -863,6 +942,7 @@ impl Service {
             event_type: event_type.into(),
             content,
             is_post: false,
+            draft_body: None,
             paths: vec![],
             assets: vec![],
             confirmed: None,
@@ -888,6 +968,8 @@ pub struct Pending {
     pub event_type: String,
     pub content: Value,
     pub is_post: bool,
+    #[serde(default)]
+    pub draft_body: Option<String>,
     pub paths: Vec<PathBuf>,
     pub assets: Vec<Asset>,
     pub confirmed: Option<OwnedEventId>,
@@ -1041,6 +1123,51 @@ pub fn write_private(path: &Path, value: &impl Serialize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reply_drafts_are_per_post_and_clear_only_the_sent_revision() {
+        let first = ReplyDraftKey {
+            room: ruma::room_id!("!room:example.org").to_owned(),
+            post: ruma::event_id!("$first:example.org").to_owned(),
+        };
+        let second = ReplyDraftKey {
+            room: first.room.clone(),
+            post: ruma::event_id!("$second:example.org").to_owned(),
+        };
+        let other_room = ReplyDraftKey {
+            room: ruma::room_id!("!other:example.org").to_owned(),
+            post: first.post.clone(),
+        };
+        let mut drafts = ReplyDrafts::default();
+        drafts.set(&first, "first reply");
+        drafts.set(&second, "second reply");
+        drafts.set(&other_room, "other room reply");
+        let encoded = serde_json::to_vec(&drafts).unwrap();
+        let mut restored: ReplyDrafts = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(restored.get(&first), "first reply");
+        assert_eq!(restored.get(&second), "second reply");
+        assert_eq!(restored.get(&other_room), "other room reply");
+
+        restored.set(&first, "revised while sending");
+        assert!(!restored.clear_if_matches(&first, "first reply"));
+        assert_eq!(restored.get(&first), "revised while sending");
+        assert!(restored.clear_if_matches(&second, "second reply"));
+        assert!(restored.get(&second).is_empty());
+        assert_eq!(restored.get(&other_room), "other room reply");
+    }
+    #[test]
+    fn only_thread_replies_map_to_reply_drafts() {
+        let room = ruma::room_id!("!room:example.org").to_owned();
+        let post = ruma::event_id!("$post:example.org").to_owned();
+        let mut pending = Pending {
+            transaction: TransactionId::new(), room: room.clone(), audience: String::new(),
+            event_type: "m.room.message".into(),
+            content: super::super::model::comment_content("reply", &post),
+            is_post: false, draft_body: None, paths: vec![], assets: vec![], confirmed: None,
+        };
+        assert_eq!(pending_reply_draft(&pending), Some((ReplyDraftKey { room, post }, "reply".into())));
+        pending.content["m.relates_to"]["rel_type"] = json!("m.replace");
+        assert!(pending_reply_draft(&pending).is_none());
+    }
     fn state() -> Vec<Value> {
         vec![
             json!({"type":"m.room.create","state_key":"","sender":"@author:example.org","content":{"type":ROOM_TYPE}}),

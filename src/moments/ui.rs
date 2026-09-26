@@ -16,7 +16,7 @@ use crate::{
     home::back_swipe::BackSwipe,
 };
 use super::{
-    backend::{Service, Feed, Timeline, Pending, ComposerDraft},
+    backend::{Service, Feed, Timeline, Pending, ComposerDraft, ReplyDraftKey},
     model::{Entry, Asset, MAX_MEDIA},
 };
 
@@ -119,8 +119,15 @@ enum Outcome {
     Feed(Feed),
     Ready(Timeline),
     Changed,
-    Sent,
+    Sent(SentKind),
     Transfer(OwnedRoomId),
+}
+#[derive(Clone, Debug)]
+enum SentKind {
+    Post { body: String, paths: Vec<PathBuf> },
+    Reply { key: ReplyDraftKey, body: String },
+    Edit(OwnedEventId),
+    Other,
 }
 #[derive(Clone, Debug)]
 struct Completed {
@@ -373,6 +380,8 @@ pub struct MomentsPanel {
     #[rust]
     pending: Option<Pending>,
     #[rust]
+    in_flight: Option<SentKind>,
+    #[rust]
     request: u64,
     #[rust]
     session: u64,
@@ -392,6 +401,22 @@ pub struct MomentsPanel {
 fn next_request() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+fn post_draft_matches(body: &str, paths: &[PathBuf], draft_body: &str, draft_paths: &[PathBuf]) -> bool {
+    paths == draft_paths && body == draft_body
+}
+fn sent_kind_for_pending(pending: &Pending) -> SentKind {
+    if pending.is_post {
+        SentKind::Post {
+            body: pending.draft_body.clone().unwrap_or_else(||
+                pending.content["body"].as_str().unwrap_or("").to_owned()),
+            paths: pending.paths.clone(),
+        }
+    } else if let Some((key, body)) = super::backend::pending_reply_draft(pending) {
+        SentKind::Reply { key, body }
+    } else {
+        SentKind::Other
+    }
 }
 
 fn composer_draft_from_bytes(bytes: Option<&[u8]>) -> ComposerDraft {
@@ -426,12 +451,52 @@ mod draft_tests {
     }
 }
 impl MomentsPanel {
+    fn detail_key(&self) -> Option<ReplyDraftKey> {
+        self.detail.as_ref().map(|post| ReplyDraftKey {
+            room: post.room.clone(), post: post.id.clone(),
+        })
+    }
+    fn save_current_reply(&self, cx: &mut Cx) {
+        if self.editing.is_some() { return; }
+        let (Some(owner), Some(key)) = (&self.owner, self.detail_key()) else { return; };
+        let body = self.text_input(cx, ids!(moments_comment)).text();
+        if matches!(&self.in_flight, Some(SentKind::Reply { key: sending_key, body: sending_body })
+            if sending_key == &key && sending_body == &body) { return; }
+        if let Err(e) = super::backend::save_reply_draft(owner, &key, &body) {
+            crate::shared::popup_list::enqueue_popup_notification(
+                crate::i18n::format("Could not save Moments draft: {e}", &[("e", e.to_string())]),
+                crate::shared::popup_list::PopupKind::Error, Some(5.0));
+        }
+    }
+    fn restore_current_reply(&mut self, cx: &mut Cx) {
+        let body = match (&self.owner, self.detail_key()) {
+            (Some(owner), Some(key)) => match super::backend::reply_draft(owner, &key) {
+                Ok(body) => body,
+                Err(e) => {
+                    self.status = crate::i18n::format("Could not load Moments draft: {e}", &[("e", e.to_string())]);
+                    String::new()
+                }
+            },
+            _ => String::new(),
+        };
+        self.text_input(cx, ids!(moments_comment)).set_text(cx, &body);
+    }
+    fn leave_detail(&mut self, cx: &mut Cx) {
+        self.save_current_reply(cx);
+        self.editing = None;
+        self.detail = None;
+        self.text_input(cx, ids!(moments_comment)).set_text(cx, "");
+    }
+    fn start_edit(&mut self, cx: &mut Cx, entry: Entry) {
+        self.save_current_reply(cx);
+        self.text_input(cx, ids!(moments_comment)).set_text(cx, entry.body());
+        self.editing = Some(entry);
+    }
     fn save_draft(&self, cx: &mut Cx) {
         let Some(owner) = &self.owner else { return };
-        if self.pending.is_some() {
-            return;
-        }
         let body = self.text_input(cx, ids!(moments_body)).text();
+        if matches!(&self.in_flight, Some(SentKind::Post { body: sending_body, paths })
+            if post_draft_matches(sending_body, paths, &body, &self.paths)) { return; }
         let path = crate::persistence::persistent_state_dir(owner).join("moments-composer.json");
         if body.is_empty() && self.paths.is_empty() {
             let _ = std::fs::remove_file(path);
@@ -461,11 +526,13 @@ impl MomentsPanel {
     }
     fn reset(&mut self, cx: &mut Cx) {
         self.save_draft(cx);
+        if self.page == Page::Details { self.save_current_reply(cx); }
         self.text_input(cx, ids!(moments_body)).set_text(cx, "");
         self.paths.clear();
         self.album_paths.clear();
         cx.stop_timer(self.timer);
         self.pending = None;
+        self.in_flight = None;
         self.owner = None;
         self.author = None;
         self.feed = Feed::default();
@@ -549,6 +616,14 @@ impl MomentsPanel {
         let request = self.request;
         let owner = service.owner.clone();
         let feed = self.feed.clone();
+        self.in_flight = match &command {
+            Command::Send(p) => Some(sent_kind_for_pending(p)),
+            Command::Comment(post, body) => Some(SentKind::Reply {
+                key: ReplyDraftKey { room: post.room.clone(), post: post.id.clone() }, body: body.clone(),
+            }),
+            Command::Retry => service.pending().ok().flatten().map(|p| sent_kind_for_pending(&p)),
+            _ => None,
+        };
         if feedback == CommandFeedback::Default {
             self.status = match &command {
                 Command::Send(_) => crate::i18n::tr("Encrypting and publishing…"),
@@ -564,16 +639,16 @@ impl MomentsPanel {
                     Command::Prepare=>{let id=if let Some(p)=service.pending()?.filter(|p|p.confirmed.is_none()){p.room}else{service.ensure_timeline().await?};Outcome::Ready(service.validate(&id).await?)},
                     Command::RetrySetup=>{let id=service.retry_timeline_setup().await?;Outcome::Ready(service.validate(&id).await?)},
                     Command::Audience=>{let id=if let Some(p)=service.pending()?.filter(|p|p.confirmed.is_none()){p.room}else{service.ensure_timeline().await?};Outcome::Ready(service.validate(&id).await?)},
-                    Command::Send(p)=>{service.send(p).await?;Outcome::Sent},
-                    Command::Retry=>{let p=service.pending()?.ok_or_else(||anyhow::anyhow!(crate::i18n::tr("No saved operation to retry.")))?;service.send(p).await?;Outcome::Sent},
+                    Command::Send(p)=>{let kind=sent_kind_for_pending(&p);service.send(p).await?;Outcome::Sent(kind)},
+                    Command::Retry=>{let p=service.pending()?.ok_or_else(||anyhow::anyhow!(crate::i18n::tr("No saved operation to retry.")))?;let kind=sent_kind_for_pending(&p);service.send(p).await?;if let SentKind::Reply{key,body}=&kind{let _=super::backend::clear_reply_draft_if_matches(&service.owner,key,body);}Outcome::Sent(kind)},
                     Command::Discard=>{service.discard_pending().await?;Outcome::Changed},
                     Command::Review(room,audience)=>{service.review_pending(&room,&audience).await?;Outcome::Changed},
-                    Command::Comment(post,body)=>{service.interact(&post,super::model::comment_content(&body,&post.id),"m.room.message",TransactionId::new()).await?;Outcome::Sent},
+                    Command::Comment(post,body)=>{let key=ReplyDraftKey{room:post.room.clone(),post:post.id.clone()};service.interact(&post,super::model::comment_content(&body,&post.id),"m.room.message",TransactionId::new()).await?;let _=super::backend::clear_reply_draft_if_matches(&service.owner,&key,&body);Outcome::Sent(SentKind::Reply{key,body})},
                     Command::Edit(entry,body)=>{
                         anyhow::ensure!(entry.sender==service.owner,crate::i18n::tr("Only your own text can be edited."));
                         let timeline=service.validate(&entry.room).await?;let mut content=entry.content.clone();content["body"]=serde_json::json!(body);
                         let wire=serde_json::json!({"msgtype":"m.text","body":format!("* {body}"),"m.new_content":content,"m.relates_to":{"rel_type":"m.replace","event_id":entry.id}});
-                        service.send(Pending{transaction:TransactionId::new(),room:entry.room,audience:timeline.audience,event_type:"m.room.message".into(),content:wire,is_post:false,paths:vec![],assets:vec![],confirmed:None}).await?;Outcome::Sent
+                        let id=entry.id.clone();service.send(Pending{transaction:TransactionId::new(),room:entry.room,audience:timeline.audience,event_type:"m.room.message".into(),content:wire,is_post:false,draft_body:None,paths:vec![],assets:vec![],confirmed:None}).await?;Outcome::Sent(SentKind::Edit(id))
                     },
                     Command::Like(post)=>{service.like(&post,TransactionId::new()).await?;Outcome::Changed},
                     Command::Redact(room,ids)=>{service.redact(&room,ids).await?;Outcome::Changed},
@@ -606,6 +681,7 @@ impl MomentsPanel {
             cx.action(MomentsAction::Close);
             return;
         }
+        if self.page == Page::Compose { self.save_draft(cx); }
         self.page = if self.page == Page::Audience {
             self.audience_return
         } else {
@@ -613,17 +689,13 @@ impl MomentsPanel {
         };
         self.redraw(cx);
     }
-    fn leave_detail(&mut self, cx: &mut Cx) {
-        self.editing = None;
-        self.detail = None;
-        self.text_input(cx, ids!(moments_comment)).set_text(cx, "");
-    }
     fn open_detail(&mut self, cx: &mut Cx, post: Entry) {
+        if self.page == Page::Details { self.leave_detail(cx); }
         self.media_index = 0;
         self.editing = None;
         self.page = Page::Details;
         self.detail = Some(post.clone());
-        self.text_input(cx, ids!(moments_comment)).set_text(cx, "");
+        self.restore_current_reply(cx);
         if !self.feed.preferences.seen.contains(&post.id) {
             self.feed.preferences.seen.insert(post.id.clone());
             self.run(cx, Command::Seen(vec![post.id]));
@@ -841,6 +913,7 @@ impl Widget for MomentsPanel {
                     continue;
                 }
                 self.busy = false;
+                self.in_flight = None;
                 self.pending = Service::current()
                     .and_then(|s| s.pending().ok().flatten())
                     .filter(|p| p.confirmed.is_none());
@@ -874,18 +947,8 @@ impl Widget for MomentsPanel {
                     Ok(Outcome::Ready(t)) => {
                         self.timeline = Some(t.clone());
                         self.status.clear();
-                        if self.page == Page::Compose {
-                            if let Some(p) = &self.pending {
-                                let body = p
-                                    .content
-                                    .pointer("/m.new_content/body")
-                                    .or_else(|| p.content.get("body"))
-                                    .and_then(serde_json::Value::as_str)
-                                    .unwrap_or(crate::i18n::tr("Saved reaction"))
-                                    .to_owned();
-                                self.text_input(cx, ids!(moments_body)).set_text(cx, &body);
-                                self.status = crate::i18n::tr("A saved send is waiting. Retry sends its saved content. Discard the retry to write a new post.").into();
-                            }
+                        if self.page == Page::Compose && self.pending.is_some() {
+                            self.status = crate::i18n::tr("A saved send is waiting. Retry sends its saved content. Discard the retry to write a new post.").into();
                         }
                     }
                     Ok(Outcome::Changed) => {
@@ -902,15 +965,31 @@ impl Widget for MomentsPanel {
                             );
                         }
                     }
-                    Ok(Outcome::Sent) => {
+                    Ok(Outcome::Sent(kind)) => {
                         self.status = crate::i18n::tr("Sent.").into();
-                        self.editing = None;
-                        if self.page == Page::Compose {
-                            self.page = Page::Feed;
-                            self.text_input(cx, ids!(moments_body)).set_text(cx, "");
-                            self.paths.clear();
+                        match kind {
+                            SentKind::Post { body, paths } => {
+                                if post_draft_matches(body, paths,
+                                    &self.text_input(cx, ids!(moments_body)).text(), &self.paths) {
+                                    self.text_input(cx, ids!(moments_body)).set_text(cx, "");
+                                    self.paths.clear();
+                                    if self.page == Page::Compose { self.page = Page::Feed; }
+                                }
+                            }
+                            SentKind::Reply { key, body } => {
+                                if self.detail_key().as_ref() == Some(key) && self.editing.is_none()
+                                    && self.text_input(cx, ids!(moments_comment)).text() == *body {
+                                    self.restore_current_reply(cx);
+                                }
+                            }
+                            SentKind::Edit(id) => {
+                                if self.editing.as_ref().is_some_and(|entry| &entry.id == id) {
+                                    self.editing = None;
+                                    if self.page == Page::Details { self.restore_current_reply(cx); }
+                                }
+                            }
+                            SentKind::Other => {}
                         }
-                        self.text_input(cx, ids!(moments_comment)).set_text(cx, "");
                         self.run(
                             cx,
                             Command::Refresh {
@@ -954,6 +1033,14 @@ impl Widget for MomentsPanel {
         if self.button(cx, ids!(header.back)).clicked(actions) {
             self.back(cx);
             return;
+        }
+        if self.page == Page::Details
+            && self.text_input(cx, ids!(moments_comment)).changed(actions).is_some() {
+            self.save_current_reply(cx);
+        }
+        if self.page == Page::Compose
+            && self.text_input(cx, ids!(moments_body)).changed(actions).is_some() {
+            self.save_draft(cx);
         }
         if self.busy && self.mutating {
             return;
@@ -1047,13 +1134,6 @@ impl Widget for MomentsPanel {
                 }
             }
             Page::Compose => {
-                if self
-                    .text_input(cx, ids!(moments_body))
-                    .changed(actions)
-                    .is_some()
-                {
-                    self.save_draft(cx);
-                }
                 if self.button(cx, ids!(moments_add_media)).clicked(actions) {
                     self.pick_media();
                 }
@@ -1077,6 +1157,7 @@ impl Widget for MomentsPanel {
                     if body.trim().is_empty() && self.paths.is_empty() {
                         self.status = crate::i18n::tr("Write a post or add a photo.").into();
                     } else if let Some(t) = &self.timeline {
+                        self.save_draft(cx);
                         self.run(
                             cx,
                             Command::Send(Pending {
@@ -1086,6 +1167,7 @@ impl Widget for MomentsPanel {
                                 event_type: "m.room.message".into(),
                                 content: super::model::post_content(&body, &[]),
                                 is_post: true,
+                                draft_body: Some(body.clone()),
                                 paths: self.paths.clone(),
                                 assets: vec![],
                                 confirmed: None,
@@ -1117,9 +1199,7 @@ impl Widget for MomentsPanel {
                         self.run(cx, Command::Hide(post.sender.clone(), true));
                     }
                     if self.button(cx, ids!(moments_edit)).clicked(actions) {
-                        self.text_input(cx, ids!(moments_comment))
-                            .set_text(cx, post.body());
-                        self.editing = Some(post.clone());
+                        self.start_edit(cx, post.clone());
                     }
                     if self.button(cx, ids!(moments_delete)).clicked(actions) {
                         self.run(
@@ -1137,6 +1217,7 @@ impl Widget for MomentsPanel {
                     {
                         let body = self.text_input(cx, ids!(moments_comment)).text();
                         if !body.trim().is_empty() {
+                            self.save_current_reply(cx);
                             self.run(
                                 cx,
                                 match self.editing.clone() {
@@ -1183,11 +1264,13 @@ impl Widget for MomentsPanel {
                         }
                         if let Some(comment) = self.comments.get(index).cloned() {
                             if row.button(cx, ids!(comment_edit)).clicked(actions) {
-                                self.text_input(cx, ids!(moments_comment))
-                                    .set_text(cx, comment.body());
-                                self.editing = Some(comment.clone());
+                                self.start_edit(cx, comment.clone());
                             }
                             if row.button(cx, ids!(comment_delete)).clicked(actions) {
+                                if self.editing.as_ref().is_some_and(|entry| entry.id == comment.id) {
+                                    self.editing = None;
+                                    self.restore_current_reply(cx);
+                                }
                                 self.run(cx, Command::Redact(comment.room, vec![comment.id]));
                             }
                         }
@@ -1736,6 +1819,19 @@ fn date(timestamp: u64) -> String {
                 .to_string()
         })
         .unwrap_or_default()
+}
+#[cfg(test)]
+mod tests {
+    use super::post_draft_matches;
+    use std::path::PathBuf;
+
+    #[test]
+    fn sent_post_only_matches_its_original_draft() {
+        let media = vec![PathBuf::from("photo.png")];
+        assert!(post_draft_matches("", &media, "", &media));
+        assert!(!post_draft_matches("caption", &media, "", &media));
+        assert!(!post_draft_matches("caption", &media, "caption", &[]));
+    }
 }
 impl MomentsPanelRef {
     /// Applies `action` to this panel.
