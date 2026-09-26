@@ -287,6 +287,10 @@ script_mod! {
                 tooltip_text: "Moments"
                 icon.draw_icon.svg: ICON_GLOBE
             }
+            octoscript_apps_button := mod.widgets.NavigationTabButton {
+                tooltip_text: "Mini apps"
+                icon.draw_icon.svg: ICON_GLOBE
+            }
             article_editor_button := mod.widgets.NavigationTabButton {
                 tooltip_text: #(crate::i18n::tr("Article editor"))
                 icon.draw_icon.svg: ICON_EDIT
@@ -667,6 +671,7 @@ impl Widget for NavigationTabBar {
             if self.view.navigation_bar_button(cx, ids!(moments_button)).clicked(actions) {
                 cx.action(crate::moments::ui::MomentsAction::Open {author: None});
             }
+            if self.view.navigation_bar_button(cx,ids!(octoscript_apps_button)).clicked(actions) {cx.action(crate::octoscript_apps::MiniAppsAction::Open);}
             if self.view.navigation_bar_button(cx, ids!(article_editor_button)).clicked(actions) {
                 cx.action(crate::article_app::ArticleAction::Open);
             }

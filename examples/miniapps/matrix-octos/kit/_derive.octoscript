@@ -1,0 +1,47 @@
+// _derive.octoscript — every SIZE, computed from the knobs.
+//
+// Concatenated AFTER the mood's delta and before the kit, so a mood that moves
+// `space_factor` or `radius_factor` moves everything that follows from it. Put
+// these in the base instead and a delta could not reach them: `let` evaluates at
+// its own line, so the derived value would already be fixed.
+//
+// The multipliers are the numbers the kit used to hardcode, so with the knobs at
+// 1/10/2 the output is byte-identical to the shipped look. Four device goldens
+// assert those numbers; the layer moves here, the look does not.
+
+// ---- spacing ------------------------------------------------------
+let pad_page_x    = 20 * space_factor
+// Clears the status bar AND leaves breathing room — but measured on device the
+// system already insets the app below the bar: the page's own fill starts at
+// y=102, under a black status area, so all 54 of these sat inside already-safe
+// space and read as the screen's single largest void (173px, 7.4%).
+//
+// 36 rather than 0: a 24dp status bar still clears with margin if some window
+// configuration ever stops insetting, and the point is to reclaim dead space,
+// not to crowd the top edge.
+let pad_page_top  = 36 * space_factor
+let pad_page_bot  = 24 * space_factor   // clears the gesture bar
+let pad_panel_x   = 14 * space_factor
+let pad_panel_y   = 12 * space_factor * media_stretch
+let pad_tile_x    = 12 * space_factor
+let pad_tile_y    = 10 * space_factor * media_stretch
+let pad_chip_x    = 10 * space_factor
+let pad_chip_y    = 5 * space_factor
+let gap_panel_top = 16 * space_factor
+let gap_row       = 6 * space_factor
+let gap_tile      = 4 * space_factor
+
+// ---- radii --------------------------------------------------------
+let radius_panel  = 14 * radius_factor
+let radius_tile   = 12 * radius_factor
+let radius_chip   = 12 * radius_factor
+
+// ---- the type scale -----------------------------------------------
+// One base and one step, as makepad's themes do it: `font_base` moves every size
+// together (accessibility), `font_step` changes the CONTRAST between them.
+let font_caption  = font_base - font_step        // 8
+let font_row      = font_base                    // 10
+let font_body     = font_base + font_step        // 12
+let font_value    = font_base + 2 * font_step    // 14
+let font_title    = font_base + 4 * font_step    // 18
+

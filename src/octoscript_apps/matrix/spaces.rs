@@ -1,0 +1,132 @@
+// SPDX-License-Identifier: MIT
+// Adapted from project-robius/robrix src/a2app/matrix/spaces.rs
+// Source revision: d4d39612fdee574a0f6a33480a19868f1ec85644
+//! Services on spaces: the joined spaces, one space's details, and its child rooms.
+
+use matrix_sdk::RoomState;
+use matrix_sdk::deserialized_responses::SyncOrStrippedState;
+use matrix_sdk::ruma::OwnedRoomId;
+use matrix_sdk::ruma::events::SyncStateEvent;
+use matrix_sdk::ruma::events::room::history_visibility::HistoryVisibility;
+use matrix_sdk::ruma::events::space::child::SpaceChildEventContent;
+use matrix_sdk::ruma::room::RoomType;
+use matrix_sdk_ui::spaces::SpaceRoomList;
+use matrix_sdk_ui::spaces::room_list::SpaceRoomListPaginationState;
+
+use super::rooms::room_name;
+use super::policy::get_client;
+use super::policy::RoomAccess;
+use super::policy::{ensure_room_access, room_access_allowed};
+
+pub(crate) async fn list() -> Result<String, String> {
+    let client = get_client().ok_or("not logged in")?;
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    for space in client.joined_rooms().into_iter().filter(|r| r.is_space()) {
+        if !room_access_allowed(space.room_id().as_str(), RoomAccess::Read) {
+            continue;
+        }
+        out.push(serde_json::json!({
+            "space_id": space.room_id(),
+            "name": room_name(&space).await,
+            "topic": space.topic().unwrap_or_default(),
+            "member_count": space.joined_members_count(),
+        }));
+    }
+    Ok(serde_json::json!({ "spaces": out }).to_string())
+}
+
+pub(crate) async fn info(space_id: OwnedRoomId) -> Result<String, String> {
+    ensure_room_access(space_id.as_str(), RoomAccess::Read)?;
+    let client = get_client().ok_or("not logged in")?;
+    let space = client.get_room(&space_id).ok_or("space not found")?;
+    if !space.is_space() || space.state() != RoomState::Joined {
+        return Err("not a joined space".into());
+    }
+    // Counted the way the SDK's space graph does: every child state event
+    // that still deserializes, redactions excluded.
+    let children_count = space
+        .get_state_events_static::<SpaceChildEventContent>()
+        .await
+        .map(|children| {
+            children
+                .iter()
+                .filter(|c| match c.deserialize() {
+                    Ok(SyncOrStrippedState::Sync(SyncStateEvent::Original(event))) => {
+                        !event.content.via.is_empty()
+                            && room_access_allowed(event.state_key.as_str(), RoomAccess::Read)
+                    }
+                    Ok(SyncOrStrippedState::Stripped(event)) => {
+                        event
+                            .content
+                            .via
+                            .as_ref()
+                            .is_some_and(|via| !via.is_empty())
+                            && room_access_allowed(event.state_key.as_str(), RoomAccess::Read)
+                    }
+                    _ => false,
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    let join_rule = space
+        .join_rule()
+        .map(|r| r.as_str().to_string())
+        .unwrap_or_else(|| String::from("unknown"));
+    Ok(serde_json::json!({
+        "space_id": space_id,
+        "name": room_name(&space).await,
+        "topic": space.topic().unwrap_or_default(),
+        "member_count": space.joined_members_count(),
+        "join_rule": join_rule,
+        "world_readable": space.history_visibility_or_default() == HistoryVisibility::WorldReadable,
+        "children_count": children_count,
+    })
+    .to_string())
+}
+
+pub(crate) async fn rooms(space_id: OwnedRoomId) -> Result<String, String> {
+    let check_space = || {
+        super::policy::global_room_access_allowed(space_id.as_str(), RoomAccess::Read)
+            .then_some(())
+            .ok_or_else(|| super::policy::ROOM_ACCESS_DENIED.to_string())
+    };
+    check_space()?;
+    let client = get_client().ok_or("not logged in")?;
+    let homeserver = client.homeserver();
+    let list = SpaceRoomList::new(client, space_id.clone()).await;
+    // Each page is one /hierarchy request; stop at the end or at the row cap.
+    loop {
+        check_space()?;
+        super::policy::ensure_server_output(homeserver.as_str())?;
+        super::policy::audit_server_operation(homeserver.as_str(), list.paginate())
+            .await
+            .map_err(|e| format!("couldn't load the space's rooms: {e}"))?;
+        let done = matches!(
+            list.pagination_state(),
+            SpaceRoomListPaginationState::Idle { end_reached: true }
+        );
+        if done || list.rooms().await.len() >= 200 {
+            break;
+        }
+    }
+    let out: Vec<serde_json::Value> = list
+        .rooms()
+        .await
+        .into_iter()
+        .filter(|room| room_access_allowed(room.room_id.as_str(), RoomAccess::Read))
+        .take(200)
+        .map(|r| {
+            serde_json::json!({
+                "room_id": r.room_id,
+                "name": r.display_name,
+                "topic": r.topic.unwrap_or_default(),
+                "is_space": matches!(r.room_type, Some(RoomType::Space)),
+                "joined": r.state == Some(RoomState::Joined),
+                "member_count": r.num_joined_members,
+                "join_rule": r.join_rule.as_ref().map(|j| j.as_str()).unwrap_or("unknown"),
+            })
+        })
+        .collect();
+    check_space()?;
+    Ok(serde_json::json!({ "rooms": out }).to_string())
+}

@@ -1,0 +1,22 @@
+# level: L0
+theme light
+state profile {shape: record}
+state answer {shape: record}
+state prompt {shape: text, initial: "Say hello in one short sentence."}
+state expanded {shape: bool, initial: false}
+event refresh {expanded: toggle}
+event typing {prompt: set($value)}
+event ask {expanded: set(true)}
+copy title {class: vocabulary, en: "Matrix + Octos"}
+copy refresh {class: vocabulary, en: "Read my Matrix profile"}
+copy ask {class: vocabulary, en: "Ask Octos"}
+copy prompt {class: vocabulary, en: "Message for Octos"}
+view root Surface {
+    TextTitle(text: copy.title)
+    TextBody(text: profile.data.display_name)
+    TextCaption(text: profile.data.user_id)
+    Chip(text: copy.refresh, on_tap: refresh)
+    Field(text: prompt, placeholder: copy.prompt, on_change: typing, on_commit: ask)
+    Chip(text: copy.ask, on_tap: ask)
+    TextBody(text: answer.data.text)
+}

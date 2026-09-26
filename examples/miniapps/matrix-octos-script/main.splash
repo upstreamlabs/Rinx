@@ -1,0 +1,35 @@
+fn read_profile(){
+    ui.profile.set_text("Loading Matrix profile…")
+    host.request("matrix.profile", {}, fn(r){
+        if r.is_ok {
+            ui.profile.set_text(r.data.display_name + " · " + r.data.user_id)
+        } else { ui.profile.set_text(r.error) }
+    })
+}
+fn read_session(){
+    ui.session.set_text("Opening Octos session…")
+    host.request("octos.session.open", {}, fn(r){
+        if r.is_ok {
+            host.request("octos.session.history", {}, fn(h){
+                if h.is_ok { ui.session.set_text(h.data.session_id) }
+                else { ui.session.set_text(h.error) }
+            })
+        } else { ui.session.set_text(r.error) }
+    })
+}
+fn ask(){
+    ui.answer.set_text("Waiting for Octos…")
+    host.request("octos.turn.start", {text: ui.prompt.text()}, fn(r){
+        if r.is_ok { ui.answer.set_text(r.data.text) }
+        else { ui.answer.set_text(r.error) }
+    })
+}
+width: Fill height: Fill flow: Down padding: 16 spacing: 12
+Label {text: "Matrix + Octos" draw_text.text_style.font_size: 24}
+profile := Label {width: Fill text: "Read your Matrix profile"}
+Button {text: "Read Matrix profile" on_click: || read_profile()}
+session := Label {width: Fill text: "Connect to the shared Octos core"}
+Button {text: "Read Octos session" on_click: || read_session()}
+prompt := TextInput {width: Fill text: "Say hello in one short sentence."}
+Button {text: "Ask Octos" on_click: || ask()}
+answer := Label {width: Fill text: ""}

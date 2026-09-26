@@ -1,0 +1,6 @@
+{
+  "events": {
+    "refresh": {"service":"matrix.profile","args":{},"target":"profile"},
+    "ask": {"service":"octos.turn.start","args":{"text":{"$state":"prompt"}},"target":"answer"}
+  }
+}

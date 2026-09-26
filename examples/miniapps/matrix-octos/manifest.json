@@ -1,0 +1,18 @@
+{
+  "capabilities": [
+    "matrix.profile",
+    "octos.turn.start",
+    "octos.turn.interrupt"
+  ],
+  "compute": {
+    "instruction_budget": 4000000,
+    "memory_bytes": 33554432
+  },
+  "id": "matrix-octos",
+  "integrity": {
+    "bundle_blake3": "2aa5bbc0ce2203b339ca3a4265e441279ac1d48c73181b79ac8def2d683fb451"
+  },
+  "name": "Matrix + Octos",
+  "schema": 1,
+  "version": "1.0.0"
+}
