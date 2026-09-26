@@ -1075,6 +1075,7 @@ impl HomeScreen {
                 current_screen.close_thread_timeline(cx);
                 app_state.selected_room = None;
                 stack_nav.pop_to_root(cx);
+                log!("Rinx navigation: returned to chat list");
             }
         }
         self.view.redraw(cx);

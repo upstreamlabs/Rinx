@@ -1,0 +1,109 @@
+// _derive_color.octoscript — COLOUR derived from seeds, the way sizes always were.
+//
+// `_derive.splash` computes every size from four knobs; colours never got the
+// same treatment, so each mood carried ~25 hand-written argb() literals and the
+// accent axis needed 48 generated files — one per mood × hue, because a delta
+// could not compute a tint against whatever ground the mood set. The missing
+// piece was believed to be a rounding builtin; it existed all along, namespaced
+// as `mod.math.round`, and the probe that "proved" its absence had called the
+// bare name.
+//
+// Spliced AFTER the mood delta and the axis fragments, BEFORE `_derive.splash`.
+// A fragment that wants a derived palette sets `seed_on = 1` and nine scalars;
+// everything below then REBINDS the surface tokens from those seeds. With
+// `seed_on = 0` (the base default) every rebind resolves to the token's prior
+// value, so all six shipped moods render byte-identically — the goldens hold.
+//
+// The ink is a SEED, not a derivation: AA clamping is an iterative search that
+// belongs in the generator that writes a ground fragment, not in a language
+// with no loops. What derives here is the MECHANICAL system — the fills,
+// hairlines and secondary inks that are relationships, not choices.
+
+fn dc_pick(c, a, b) { if c > 0 { return a } return b }
+fn dc_mix(a, b, t) { return mod.math.round(a + (b - a) * t) }
+// Perceived lightness, gamma-blind but monotonic — only ever used to pick a
+// DIRECTION (toward white or toward black), never a ratio.
+fn dc_lum(r, g, b) { return 0.2126 * r + 0.7152 * g + 0.0722 * b }
+
+// The far pole the panel lifts toward: away from wherever the ground sits.
+let dc_dark   = dc_lum(seed_ground_r, seed_ground_g, seed_ground_b) < 128
+fn dc_pole()  { return dc_pick(dc_dark, 255, 0) }
+
+// DEFINED BELOW, after the accent solve rebinds the ink seeds.
+//
+// A function in this VM keeps the binding a name had when the function was
+// DEFINED — asked on the device, the boot selftest logs the answer. Defined
+// here, `dc_toward_ink` read the ORIGINAL `seed_ink_*` and never saw the
+// accent-tinted values the solve below produces, so every ink it derives
+// (l0_text, l0_soft, l0_dim) came out untinted and the whole accent-as-seed
+// path was inert. A call may precede a definition, so moving the definitions
+// past the rebinds is the entire fix.
+
+// ---- accent-as-seed: the ground x accent composition ----------------------
+// When BOTH a seeded ground and a seeded hue are present, the ink is pulled
+// toward the hue as hard as this ground can carry: an UNROLLED five-step
+// contrast solve (no loops in this language; five nested picks are the loop).
+// The threshold is 4.9 against the ground — margin over AA's 4.5 to cover the
+// panel lift, matching the offline auditor's math exactly.
+fn dc_lin(c) { return mod.math.pow(c / 255, 2.2) }
+fn dc_rlum(r, g, b) {
+    return 0.2126 * dc_lin(r) + 0.7152 * dc_lin(g) + 0.0722 * dc_lin(b)
+}
+fn dc_contrast(r1, g1, b1, r2, g2, b2) {
+    let a = dc_rlum(r1, g1, b1)
+    let b = dc_rlum(r2, g2, b2)
+    let hi = dc_pick(a > b, a, b)
+    let lo = dc_pick(a > b, b, a)
+    return (hi + 0.05) / (lo + 0.05)
+}
+fn dc_tint_ok(t) {
+    return dc_contrast(
+        dc_mix(seed_ink_r, seed_hue_r, t), dc_mix(seed_ink_g, seed_hue_g, t),
+        dc_mix(seed_ink_b, seed_hue_b, t),
+        seed_ground_r, seed_ground_g, seed_ground_b) >= 4.9
+}
+let dc_t = dc_pick(dc_tint_ok(1.0), 1.0,
+           dc_pick(dc_tint_ok(0.85), 0.85,
+           dc_pick(dc_tint_ok(0.7), 0.7,
+           dc_pick(dc_tint_ok(0.55), 0.55,
+           dc_pick(dc_tint_ok(0.4), 0.4, 0.0)))))
+let dc_both = seed_on * seed_hue_on
+let seed_ink_r = dc_pick(dc_both, dc_mix(seed_ink_r, seed_hue_r, dc_t), seed_ink_r)
+let seed_ink_g = dc_pick(dc_both, dc_mix(seed_ink_g, seed_hue_g, dc_t), seed_ink_g)
+let seed_ink_b = dc_pick(dc_both, dc_mix(seed_ink_b, seed_hue_b, dc_t), seed_ink_b)
+let seed_accent_r = dc_pick(dc_both, seed_hue_r, seed_accent_r)
+let seed_accent_g = dc_pick(dc_both, seed_hue_g, seed_accent_g)
+let seed_accent_b = dc_pick(dc_both, seed_hue_b, seed_accent_b)
+
+fn dc_toward_ink(t) {
+    return argb(255, dc_mix(seed_ground_r, seed_ink_r, t),
+                     dc_mix(seed_ground_g, seed_ink_g, t),
+                     dc_mix(seed_ground_b, seed_ink_b, t))
+}
+fn dc_toward_pole(t) {
+    return argb(255, dc_mix(seed_ground_r, dc_pole(), t),
+                     dc_mix(seed_ground_g, dc_pole(), t),
+                     dc_mix(seed_ground_b, dc_pole(), t))
+}
+
+// The relationships, lifted verbatim from the E4 solver's shipped ratios.
+let l0_base     = dc_pick(seed_on, argb(255, seed_ground_r, seed_ground_g, seed_ground_b), l0_base)
+let l0_base_2   = dc_pick(seed_on, dc_toward_pole(0.055), l0_base_2)
+let l0_fill     = dc_pick(seed_on, dc_toward_pole(0.07), l0_fill)
+let l0_sheet    = dc_pick(seed_on, dc_toward_pole(0.05), l0_sheet)
+let l0_hairline = dc_pick(seed_on, dc_toward_ink(0.14), l0_hairline)
+let l0_stroke   = dc_pick(seed_on, dc_toward_ink(0.18), l0_stroke)
+let l0_active   = dc_pick(seed_on, dc_toward_ink(0.20), l0_active)
+let l0_bar_rail = dc_pick(seed_on, dc_toward_ink(0.16), l0_bar_rail)
+let l0_text     = dc_pick(seed_on, dc_toward_ink(1.00), l0_text)
+let l0_soft     = dc_pick(seed_on, dc_toward_ink(0.90), l0_soft)
+let l0_dim      = dc_pick(seed_on, dc_toward_ink(0.66), l0_dim)
+let l0_accent   = dc_pick(seed_on, argb(255, seed_accent_r, seed_accent_g, seed_accent_b), l0_accent)
+let l0_bar      = dc_pick(seed_on, l0_accent, l0_bar)
+let l0_go       = dc_pick(seed_on, l0_accent, l0_go)
+// A photo page never paints l0_base under its text; recolour the scrim the
+// photo palette lays over the picture, keeping its alphas — the mechanism.
+let l0_scrim_top = dc_pick(seed_on,
+    argb( 56, seed_ground_r, seed_ground_g, seed_ground_b), l0_scrim_top)
+let l0_scrim     = dc_pick(seed_on,
+    argb(242, seed_ground_r, seed_ground_g, seed_ground_b), l0_scrim)

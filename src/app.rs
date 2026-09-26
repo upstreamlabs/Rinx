@@ -27,6 +27,7 @@ use crate::shared::file_upload_modal::{FileUploadModalWidgetRefExt, FileUploadMo
 #[cfg(feature = "agent_chat")]
 use crate::agent_chat::ops::ui::{AgentOpsAction, AgentOpsPanelWidgetRefExt};
 use crate::moments::ui::{MomentsAction, MomentsPanelWidgetRefExt};
+use crate::octoscript_apps::{MiniAppsAction, MiniAppsPanelWidgetRefExt};
 use crate::article_app::{ArticleAction, ArticlePanelWidgetRefExt};
 use crate::mini_app::{MiniAppAction, MiniAppPanelWidgetRefExt};
 use crate::forwarding::{ForwardAction, ForwardPanelWidgetRefExt};
@@ -131,6 +132,7 @@ mod embedded_content {
                 }
 
                 article_app_modal := Modal {can_dismiss: false content := ArticlePanel {}}
+                octoscript_apps_modal := Modal {can_dismiss: false content := MiniAppsPanel {}}
                 mini_app_modal := Modal {
                     can_dismiss: false
                     content := MiniAppPanel {}
@@ -373,6 +375,9 @@ impl MatchEvent for App {
             // When not yet logged in, the login_screen widget handles displaying the failure modal.
             if let Some(LoginAction::LoginFailure(_)) = action.downcast_ref() {
                 crate::article_app::invalidate_sessions();
+                crate::octoscript_apps::invalidate_sessions();
+                let mini_modal=self.ui.modal(cx,ids!(octoscript_apps_modal));
+                self.ui.mini_apps_panel(cx,ids!(octoscript_apps_modal.content)).action(cx,mini_modal,&MiniAppsAction::Close);
                 let modal = self.ui.modal(cx, ids!(article_app_modal));
                 self.ui.article_panel(cx, ids!(article_app_modal.content)).action(cx, modal, &ArticleAction::Close);
                 self.article_window_host(cx).close(cx);
@@ -434,6 +439,11 @@ impl MatchEvent for App {
                 } else {
                     self.ui.article_panel(cx, ids!(article_app_modal.content)).action(cx, modal, action);
                 }
+                continue;
+            }
+            if let Some(action) = action.downcast_ref::<MiniAppsAction>() {
+                let modal=self.ui.modal(cx,ids!(octoscript_apps_modal));
+                self.ui.mini_apps_panel(cx,ids!(octoscript_apps_modal.content)).action(cx,modal,action);
                 continue;
             }
             if let Some(action) = action.downcast_ref::<MiniAppAction>() {
@@ -817,6 +827,8 @@ impl App {
             let modal = self.ui.modal(cx, ids!(agent_ops_modal));
             self.ui.agent_ops_panel(cx, ids!(agent_ops_modal.content)).action(cx, modal, &AgentOpsAction::Close);
         }
+        let mini_modal=self.ui.modal(cx,ids!(octoscript_apps_modal));
+        self.ui.mini_apps_panel(cx,ids!(octoscript_apps_modal.content)).action(cx,mini_modal,&MiniAppsAction::Close);
         let modal = self.ui.modal(cx, ids!(article_app_modal));
         self.ui.article_panel(cx, ids!(article_app_modal.content)).action(cx, modal, &ArticleAction::Close);
         self.article_window_host(cx).close(cx);
@@ -889,6 +901,7 @@ pub fn register_widgets(vm: &mut ScriptVm) {
     crate::shared::script_mod(vm);
     crate::mini_app::script_mod(vm);
     crate::article_app::script_mod(vm);
+    crate::octoscript_apps::script_mod(vm);
     crate::forwarding::script_mod(vm);
 
     #[cfg(feature = "tsp")]
@@ -934,6 +947,15 @@ impl AppMain for App {
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
+        // A running mini app owns Back before the room/navigation widgets
+        // behind its modal. Close synchronously so a hosting shell sees that
+        // the navigation event was consumed by Rinx.
+        let mini_modal = self.ui.modal(cx, ids!(octoscript_apps_modal));
+        if mini_modal.is_open() && event.back_pressed() {
+            self.ui.mini_apps_panel(cx, ids!(octoscript_apps_modal.content))
+                .action(cx, mini_modal, &MiniAppsAction::Close);
+            return;
+        }
         if let Event::LiveEdit = event {
             self.app_state.app_prefs.broadcast_all(cx);
         }

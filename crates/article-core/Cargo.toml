@@ -12,7 +12,7 @@ default = []
 l0 = ["dep:octoscript-ui-l0"]
 
 [dependencies]
-makepad-markdown = { git = "https://github.com/OctoSense-org/makepad", rev = "1d3d383e84a66dbb18a4a860f505430c9d5b20f4", features = ["editormd"] }
+makepad-markdown = { git = "https://github.com/OctoSense-org/makepad", rev = "3fda5b6f9b48f390bd5396938a95d30ad035cd6d", features = ["editormd"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rand = "0.8.5"

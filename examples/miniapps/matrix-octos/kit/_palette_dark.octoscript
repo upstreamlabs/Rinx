@@ -1,0 +1,215 @@
+// _palette_dark.octoscript — the BASE theme: every token, and the reference for the rest.
+//
+// A THEME IS A PALETTE PREFIX. The DSL has no `import`, so a card is rendered by
+// concatenating <palette> + `_kit.splash` + the lowered card. The palette must
+// come FIRST: a function body resolves a name at its declaration point, so a
+// palette appended after the kit would not reach the roles that read it.
+//
+// ASSEMBLY IS `base + delta + _derive + kit`, in that order, and the order is
+// load-bearing. This file holds the KNOBS and the COLOURS; a mood is a DELTA that
+// restates only what differs; `_derive.splash` then computes every size FROM the
+// knobs. Derivation has to come after the delta or a mood could not move a knob —
+// `let` evaluates at its own line, so a delta setting `radius_factor` after
+// `radius_panel` was already computed would change nothing. It works at all
+// because a name resolves to its most recent binding and the kit's roles are
+// declared last, after all three.
+//
+// A token this file omits is not a default: it coerces to 0, which is
+// transparent for a colour and zero for a size, and the role that reads it draws
+// nothing. `l0_palettes_agree` in `tests/l0_kit.rs` pins the set, and pins every
+// delta to naming only tokens that exist here — a typo in a delta is otherwise
+// silent.
+//
+// Hex from the shipped lowering, as ARGB. Note makepad writes #RRGGBBAA, so
+// `#ffffff12` is white at alpha 0x12 — a barely-there panel over a dark page,
+// not a near-white fill.
+
+fn argb(a, r, g, b) { return ((a * 256 + r) * 256 + g) * 256 + b }
+
+// ---- knobs -----------------------------------------------------------------
+// The whole point of Option A: a handful of dials, everything else derived from
+// them, so a mood can be "dark but roomier" without restating a layout. Values
+// are 1 / 10 / 2 because that reproduces the shipped numbers EXACTLY — the layer
+// moves here, the look does not. Four device goldens assert those numbers.
+//
+// Integers on purpose. A fractional `space_factor` is legal and yields floats,
+// which every size slot accepts; the TYPE scale is dialled with `font_base` and
+// `font_step` instead, so a larger-text theme does not have to risk a fractional
+// font size.
+let space_factor  = 1
+let radius_factor = 1
+let font_base     = 10
+let font_step     = 2
+
+// ---- weights ---------------------------------------------------------------
+// Not derived: a weight is a discrete choice from what a font actually ships.
+let weight_normal = 400
+let weight_medium = 500
+let weight_semi   = 600
+let weight_bold   = 700
+// The one number a card exists to show gets its own axis: a hero over a
+// list is bold; a hero over a photograph wants a hairline. Moods dial it.
+let weight_hero   = 700
+// The hero's top-step multiplier; only a surface whose hero dominates a
+// photograph moves it (see l0_hero).
+let hero_factor   = 1
+// Data-vis restraint knobs: 0 = the widget's legacy look.
+// A single hue on a faint rail, not the nine-stop spectrum.
+//
+// Same natural experiment that decided `icon_mono`: `photo` was the only mood
+// carrying these and the only one a judge did NOT accuse of "spectral gradient
+// bars that break the restrained palette". A rainbow ramp also encodes nothing
+// — the bar's LENGTH already carries the range — so the spectrum is decoration
+// competing with the type for attention.
+let l0_bar        = argb(255, 109, 121, 240)   // #6d79f0 indigo
+
+// The base's own accent, under the name the derivation reads.
+//
+// Nothing bound `l0_accent` unless a card named an accent AXIS, and
+// `_derive_color` reads its previous binding — so every base mood errored once
+// and painted the accent fully transparent, silently, because 0 is a legal
+// colour. The value is not invented here: `l0_bar` above IS this palette's
+// accent, and an accent fragment says so explicitly (`l0_bar = l0_accent`).
+// A fragment spliced later still overrides this.
+let l0_accent     = l0_bar
+let l0_bar_rail   = argb( 41, 255, 255, 255)   // #ffffff29 faint rail on a dark page
+// Single-ink glyphs, not the filled multi-colour ones.
+//
+// A natural experiment decided this. Scoring the four moods, `photo` was the
+// only one carrying `icon_mono = 1` and the only one a judge did NOT accuse of
+// "system emoji icons instead of custom iconography" — the other three, all at
+// 0, were each flagged for it. A filled multi-colour cloud reads as a stock
+// emoji dropped into the card; recoloured to the text ink it reads as the
+// card's own iconography.
+let icon_mono     = 1
+let l0_font_src   = ""
+// A floating pane's side inset; 0 = the classic full-bleed panel.
+let panel_inset   = 0
+// One line per list row, with an ellipsis. 0 would mean unlimited.
+let row_lines     = 1
+// A surface outline. 0 = none; the mood supplies both width and ink.
+let panel_border  = 0
+// How high a panel floats. 0 = flat, which is this mood's answer; a mood that
+// wants a raised card dials it up and `Attrs.elevation` casts the shadow.
+let panel_lift    = 0
+// How much of a card's own large `Col(gap:)` survives. 1 keeps every pixel of
+// the card's air, which is right when a photograph fills it. A flat mood has
+// nothing behind that air, so it reads as a hole and is tightened.
+let air_factor    = 0.62
+
+// ---- colours ---------------------------------------------------------------
+// The canonical page colour, and the TOP of the fall — deliberately NOT lifted.
+//
+// An earlier attempt made the gradient visible by raising this to #131a25. That
+// worked (fall 5 -> 11) but paid for it where it hurts: the hero's contrast
+// against the page fell from 11.0:1 to 8.0:1, and a judge immediately called
+// the text contrast low. Deepening the BOTTOM instead buys a LARGER fall for
+// free, because the top is where the type sits and the bottom is where the
+// content has already ended.
+let l0_base     = argb(255,  10,  14,  20)   // #0a0e14  page, top of the fall
+// The page's second stop. A page that is one flat colour reads as a default
+// rather than a decision; a few levels of vertical fall gives it a horizon.
+// The BOTTOM stop, taken to near-black. Fall of 13 levels — more than lifting
+// the top achieved — and the hero keeps its full 11:1.
+let l0_base_2   = argb(255,   0,   1,   3)   // #000103
+let l0_scrim    = argb(102,   0,   0,   0)   // #00000066 photo scrim, bottom stop
+let l0_scrim_top = argb( 34,   0,   0,   0)   // #00000022 photo scrim, top stop
+// A sheet floating over a MAP, and the one fill in this palette that must be
+// fully opaque. `l0_fill` is 7% white, which is a window rather than a surface:
+// over a map the road labels read straight through whatever the card put there.
+// The colour is the shipping nav card's own sheet.
+let l0_sheet    = argb(255,  15,  22,  32)   // #0f1620 over a map
+// The one action that ENDS something. Values from the shipping nav card's `endrow`.
+let l0_danger   = argb(255, 122,  31,  31)   // #7a1f1f destructive fill
+let l0_danger_i = argb(255, 255, 217, 217)   // #ffd9d9 its ink
+// NOT `l0_panel`, and the name is the whole point.
+//
+// `fn l0_panel(kids)` is a ROLE in the kit, so a palette entry of the same name
+// is shadowed by it from the function's declaration onward — and a function
+// coerced to a colour is 0. Every use after `fn l0_panel` silently became fully
+// transparent: `l0_chip` and `l0_field` both asked for this fill and both got
+// nothing. Uses INSIDE `l0_panel`'s own body still resolved to the colour, which
+// is why panels looked right and chips did not, and why it read as a chip bug.
+//
+// Found by live-testing a nav card on a phone: Go and End rendered as bare text
+// with no button under them. No unit test could see it — zero is a valid colour.
+let l0_fill     = argb( 18, 255, 255, 255)   // #ffffff12 panel fill
+let l0_active   = argb( 56, 255, 255, 255)   // #ffffff38 selected chip
+let l0_hairline = argb( 26, 255, 255, 255)   // #ffffff1a divider
+// The surface outline's ink. Declared HERE, after `l0_hairline`, and not up with
+// the other stroke knobs: `let` evaluates at its own line, so reading a colour
+// declared 27 lines below yielded an unresolved name — which coerces to 0, a
+// fully transparent stroke. That is why borders emitted at the right width and
+// painted nothing.
+let l0_stroke   = l0_hairline
+let l0_text     = argb(255, 255, 255, 255)   // #ffffff   primary
+let l0_soft     = argb(230, 255, 255, 255)   // #ffffffe6 secondary
+let l0_dim      = argb(153, 255, 255, 255)   // #ffffff99 captions and labels
+let l0_up       = argb(255,  50, 215,  75)   // #32d74b   a rise
+let l0_go       = argb(255,  52, 199,  89)   // #34c759   the action a screen is for
+let l0_ondark   = argb(255,  14,  22,  32)   // #0e1620   text on a lit fill
+let l0_down     = argb(255, 255,  69,  58)   // #ff453a   a fall
+
+// The theme's surface grain. Empty here: the base moods are flat, and a
+// texture arrives only when a card names one on its theme line.
+let l0_texture   = ""
+let l0_texture_a = 0.06
+let l0_texture_s = 6
+
+// The theme's shadow. Zero ink means "no opinion": the backend keeps the
+// soft shadow it derives from `elevation`, which is what every mood shipped
+// before a card could ask for anything else.
+let l0_shadow_ink  = argb(0, 0, 0, 0)
+let l0_shadow_blur = 0
+let l0_shadow_dx   = 0
+let l0_shadow_dy   = 0
+
+// Type. `sans` in every base mood, so a card naming no type axis renders the
+// face it always did. The display family is separate so a serif headline over
+// a sans body — the commonest pairing in the corpus — is one axis, not two.
+let l0_family         = "sans"
+let l0_display_family = "sans"
+let l0_tracking       = 0
+
+// Which way the page gradient runs. Down in every base mood, which is what
+// the shader defaulted to anyway — now it is a choice rather than the only
+// branch anything ever took.
+let l0_grad_across = 0
+
+// The colour-seed switch. Zero everywhere by default: `_derive_color`
+// then leaves every token exactly as the mood wrote it, so the six
+// shipped moods render byte-identically. A `ground:` fragment flips it
+// and supplies the nine seeds.
+let seed_on       = 0
+let seed_ground_r = 0
+let seed_ground_g = 0
+let seed_ground_b = 0
+let seed_ink_r    = 0
+let seed_ink_g    = 0
+let seed_ink_b    = 0
+let seed_accent_r = 0
+let seed_accent_g = 0
+let seed_accent_b = 0
+
+// The content-card gradient. Zero = flat (every base mood); a pack sets
+// both stops to give its cards the design system's signature fill.
+let l0_card_1 = 0
+let l0_card_2 = 0
+// The ink that card reads with. A pack's card colour is part of its identity
+// and stays put across the pack's light and dark variants, while `l0_text`
+// flips — so a card states its own ink rather than borrowing the page's.
+// Unused while the stops are zero, since then a card is just a panel.
+let l0_card_ink = argb(255, 255, 255, 255)
+
+// The accent-as-seed switch: an accent fragment sets the hue; only when a
+// seeded ground is ALSO present does the in-kit solve replace the mood-
+// solved literals.
+let seed_hue_on = 0
+let seed_hue_r  = 0
+let seed_hue_g  = 0
+let seed_hue_b  = 0
+
+// Frame-fill stretch: >1 grows media heights and card paddings so a
+// sparse card fills its design frame. 1 everywhere but the fidelity
+// harness, which measures dead space and re-renders with the ratio.
+let media_stretch = 1

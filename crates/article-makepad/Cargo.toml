@@ -8,7 +8,7 @@ description = "Reusable native Makepad article editing and viewing widgets"
 [workspace]
 
 [dependencies]
-makepad-markdown-widgets = { git = "https://github.com/OctoSense-org/makepad", rev = "1d3d383e84a66dbb18a4a860f505430c9d5b20f4", features = ["full", "editormd"] }
+makepad-markdown-widgets = { git = "https://github.com/OctoSense-org/makepad", rev = "3fda5b6f9b48f390bd5396938a95d30ad035cd6d", features = ["full", "editormd"] }
 article-core = { path = "../article-core" }
 makepad-widgets = { git = "https://github.com/kevinaboos/makepad", branch = "button-grab-key-focus", features = ["serde"] }
 unicode-segmentation = "1.11.0"
@@ -16,4 +16,4 @@ libc = "0.2"
 
 # Keep all Makepad widgets on the same compatibility revision as the renderer.
 [patch."https://github.com/kevinaboos/makepad"]
-makepad-widgets = { git = "https://github.com/OctoSense-org/makepad", rev = "1d3d383e84a66dbb18a4a860f505430c9d5b20f4" }
+makepad-widgets = { git = "https://github.com/OctoSense-org/makepad", rev = "3fda5b6f9b48f390bd5396938a95d30ad035cd6d" }

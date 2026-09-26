@@ -1,0 +1,13 @@
+[package]
+name = "rinx-miniapp-core"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0 AND MIT"
+description = "Host-independent mini-app identity, service grants and A2App Matrix contracts"
+
+[workspace]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
