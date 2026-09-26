@@ -84,6 +84,8 @@ pub struct LoginMethods {
     pub homeserver: String,
     pub password: bool,
     pub sso: bool,
+    pub oauth_aware_preferred: bool,
+    pub browser_registration: bool,
     pub providers: Vec<LoginProvider>,
 }
 
@@ -93,6 +95,8 @@ pub async fn login_methods(client: &Client) -> Result<LoginMethods> {
         homeserver: client.homeserver().to_string(),
         password: false,
         sso: false,
+        oauth_aware_preferred: false,
+        browser_registration: false,
         providers: Vec::new(),
     };
     for flow in response.flows {
@@ -100,6 +104,10 @@ pub async fn login_methods(client: &Client) -> Result<LoginMethods> {
             LoginType::Password(_) => methods.password = true,
             LoginType::Sso(sso) => {
                 methods.sso = true;
+                methods.oauth_aware_preferred = sso.oauth_aware_preferred;
+                if sso.oauth_aware_preferred {
+                    methods.browser_registration = browser_registration_supported(client).await;
+                }
                 methods
                     .providers
                     .extend(sso.identity_providers.into_iter().map(|p| LoginProvider {
@@ -111,6 +119,27 @@ pub async fn login_methods(client: &Client) -> Result<LoginMethods> {
         }
     }
     Ok(methods)
+}
+
+/// Registration is a user action, not the OAuth dynamic client registration
+/// endpoint. The issuer advertises browser account creation with `prompt=create`.
+async fn browser_registration_supported(client: &Client) -> bool {
+    let Ok(metadata_url) = client.homeserver().join("_matrix/client/v1/auth_metadata") else {
+        return false;
+    };
+    let Ok(response) = matrix_sdk::reqwest::Client::new().get(metadata_url).timeout(std::time::Duration::from_secs(10)).send().await else {
+        return false;
+    };
+    if !response.status().is_success() {
+        return false;
+    }
+    let Ok(body) = response.bytes().await else {
+        return false;
+    };
+    let Ok(metadata) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return false;
+    };
+    metadata["prompt_values_supported"].as_array().is_some_and(|values| values.iter().any(|value| value == "create"))
 }
 
 /// Memory-only discovery: checking a server does not create a session/database.
@@ -129,13 +158,63 @@ pub async fn discover(user: &str, server: &str) -> Result<LoginMethods> {
     login_methods(&client).await
 }
 
+/// Complete a legacy registration when the homeserver offers a simple UIAA
+/// dummy or registration-token stage. Other stages need their own client UI.
+pub async fn register_account(client: &Client, username: String, password: String, token: String) -> Result<()> {
+    use matrix_sdk::ruma::api::client::{account::register::v3::Request, uiaa::{AuthData, AuthType, Dummy, RegistrationToken}};
+
+    let mut request = Request::new();
+    request.username = Some(username);
+    request.password = Some(password);
+    request.refresh_token = true;
+    match client.matrix_auth().register(request.clone()).await {
+        Ok(_) => {}
+        Err(error) => {
+            let Some(challenge) = error.as_uiaa_response() else { return Err(error.into()) };
+            let session_id = challenge.session.clone();
+            let flow = challenge.flows.iter().find(|flow| flow.stages.as_slice() == [AuthType::Dummy])
+                .or_else(|| challenge.flows.iter().find(|flow| flow.stages.as_slice() == [AuthType::RegistrationToken]));
+            match flow.map(|flow| flow.stages.first()) {
+                Some(Some(AuthType::Dummy)) => {
+                    let mut auth = Dummy::new();
+                    auth.session = session_id;
+                    request.auth = Some(AuthData::Dummy(auth));
+                }
+                Some(Some(AuthType::RegistrationToken)) => {
+                    if token.is_empty() {
+                        bail!("This server requires a registration token. Enter it and try again.");
+                    }
+                    let mut auth = RegistrationToken::new(token);
+                    auth.session = session_id;
+                    request.auth = Some(AuthData::RegistrationToken(auth));
+                }
+                _ => bail!("This server requires a registration step that Rinx cannot complete yet."),
+            }
+            client.matrix_auth().register(request).await?;
+        }
+    }
+    if !client.matrix_auth().logged_in() {
+        bail!("Account created, but the server did not issue a login session. Please sign in.");
+    }
+    Ok(())
+}
+
 #[cfg(not(target_os = "ios"))]
-pub async fn browser_login<F, Fut>(client: &Client, provider_id: Option<&str>, open: F) -> matrix_sdk::Result<()>
+pub async fn browser_login<F, Fut>(client: &Client, provider_id: Option<&str>, register: bool, open: F) -> matrix_sdk::Result<()>
 where
     F: FnOnce(String) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = matrix_sdk::Result<()>> + Send + 'static,
 {
-    let mut login = client.matrix_auth().login_sso(open);
+    let mut login = client.matrix_auth().login_sso(move |sso_url| async move {
+        let sso_url = if register {
+            let mut url = url::Url::parse(&sso_url).map_err(|error| matrix_sdk::Error::Io(std::io::Error::other(error)))?;
+            url.query_pairs_mut().append_pair("action", "register");
+            url.into()
+        } else {
+            sso_url
+        };
+        open(sso_url).await
+    });
     if let Some(id) = provider_id {
         login = login.identity_provider_id(id);
     }
@@ -199,6 +278,9 @@ mod tests {
     }
     impl Server {
         fn new() -> Self {
+            Self::with_registration(None)
+        }
+        fn with_registration(registration_token: Option<&'static str>) -> Self {
             use std::{
                 io::{Read, Write},
                 sync::{
@@ -248,18 +330,30 @@ mod tests {
                     };
                     let route = head.lines().next().unwrap().to_owned();
                     let json = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
-                    received.lock().unwrap().push((route.clone(), json));
+                    received.lock().unwrap().push((route.clone(), json.clone()));
+                    let mut status = "200 OK";
                     let response = if route.contains("/versions ") {
                         serde_json::json!({"versions":["v1.11"],"unstable_features":{}})
+                    } else if route.contains("/auth_metadata ") {
+                        serde_json::json!({"prompt_values_supported":["login","create"]})
                     } else if route.starts_with("GET ") && route.contains("/login ") {
-                        serde_json::json!({"flows":[{"type":"m.login.password"},{"type":"m.login.sso","identity_providers":[{"id":"company-custom-id","name":"Company SSO"}]},{"type":"m.login.token"}]})
+                        serde_json::json!({"flows":[{"type":"m.login.password"},{"type":"m.login.sso","oauth_aware_preferred":true,"identity_providers":[{"id":"company-custom-id","name":"Company SSO"}]},{"type":"m.login.token"}]})
+                    } else if route.starts_with("POST ") && route.contains("/register ") && registration_token.is_some() {
+                        let stage = if registration_token == Some("") { "m.login.dummy" } else { "m.login.registration_token" };
+                        let completed = json["auth"]["type"] == stage && (stage == "m.login.dummy" || json["auth"]["token"] == registration_token.unwrap());
+                        if completed {
+                            serde_json::json!({"user_id":"@fixture:localhost","device_id":"TESTDEVICE","access_token":"fixture-access","refresh_token":"fixture-refresh"})
+                        } else {
+                            status = "401 Unauthorized";
+                            serde_json::json!({"flows":[{"stages":[stage]}],"session":"fixture-registration-session"})
+                        }
                     } else if route.starts_with("POST ") && route.contains("/login ") {
                         serde_json::json!({"user_id":"@fixture:localhost","device_id":"TESTDEVICE","access_token":"fixture-access","refresh_token":"fixture-refresh"})
                     } else {
                         serde_json::json!({})
                     };
                     let body = response.to_string();
-                    let _ = write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                    let _ = write!(socket, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
                 }
             });
             Self {
@@ -291,8 +385,35 @@ mod tests {
         let server = Server::new();
         let methods = login_methods(&server.client().await).await.unwrap();
         assert!(methods.password && methods.sso);
+        assert!(methods.oauth_aware_preferred && methods.browser_registration);
         assert_eq!(methods.providers[0].id, "company-custom-id");
         assert_eq!(methods.providers[0].name, "Company SSO");
+    }
+
+    #[tokio::test]
+    async fn legacy_registration_completes_dummy_challenge() {
+        let server = Server::with_registration(Some(""));
+        let client = server.client().await;
+        register_account(&client, "new_user".into(), "a-strong-password".into(), "".into()).await.unwrap();
+        assert!(client.matrix_auth().logged_in());
+        let requests = server.requests.lock().unwrap();
+        let registrations: Vec<_> = requests.iter().filter(|(route, _)| route.contains("/register ")).collect();
+        assert_eq!(registrations.len(), 2);
+        assert_eq!(registrations[1].1["auth"]["type"], "m.login.dummy");
+        assert_eq!(registrations[1].1["auth"]["session"], "fixture-registration-session");
+    }
+
+    #[tokio::test]
+    async fn token_registration_requires_a_token_before_retrying() {
+        let server = Server::with_registration(Some("invite"));
+        let client = server.client().await;
+        let error = register_account(&client, "new_user".into(), "a-strong-password".into(), "".into()).await.unwrap_err();
+        assert!(error.to_string().contains("registration token"));
+        register_account(&client, "new_user".into(), "a-strong-password".into(), "invite".into()).await.unwrap();
+        let requests = server.requests.lock().unwrap();
+        let registrations: Vec<_> = requests.iter().filter(|(route, _)| route.contains("/register ")).collect();
+        assert_eq!(registrations.len(), 3);
+        assert_eq!(registrations[2].1["auth"]["token"], "invite");
     }
 
     #[cfg(not(target_os = "ios"))]
@@ -300,7 +421,7 @@ mod tests {
     async fn selected_provider_uses_advertised_id_and_exchanges_token() {
         let server = Server::new();
         let client = server.client().await;
-        browser_login(&client, Some("company-custom-id"), |link| async move {
+        browser_login(&client, Some("company-custom-id"), false, |link| async move {
             let url = Url::parse(&link).unwrap();
             assert!(url.path().ends_with("/login/sso/redirect/company-custom-id"));
             let redirect = url
@@ -340,12 +461,29 @@ mod tests {
 
     #[cfg(not(target_os = "ios"))]
     #[tokio::test]
+    async fn browser_registration_sets_matrix_action_parameter() {
+        let server = Server::new();
+        let client = server.client().await;
+        browser_login(&client, None, true, |link| async move {
+            let url = Url::parse(&link).unwrap();
+            assert!(url.query_pairs().any(|(key, value)| key == "action" && value == "register"));
+            let redirect = url.query_pairs().find(|(key, _)| key == "redirectUrl").unwrap().1.into_owned();
+            let mut callback = Url::parse(&redirect).unwrap();
+            callback.query_pairs_mut().append_pair("loginToken", "fixture-login-token");
+            matrix_sdk::reqwest::get(callback).await.unwrap().error_for_status().unwrap();
+            Ok(())
+        }).await.unwrap();
+        assert!(client.matrix_auth().logged_in());
+    }
+
+    #[cfg(not(target_os = "ios"))]
+    #[tokio::test]
     async fn cancellation_closes_callback_and_does_not_exchange_token() {
         let server = Server::new();
         let client = server.client().await;
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
-            browser_login(&client, None, |link| async move {
+            browser_login(&client, None, false, |link| async move {
                 let url = Url::parse(&link).unwrap();
                 let redirect = url
                     .query_pairs()

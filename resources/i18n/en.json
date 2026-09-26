@@ -1064,5 +1064,16 @@
   "Enter your password.": "Enter your password.",
   "Sign in with {provider}": "Sign in with {provider}",
   "Edit": "Edit",
-  "Selected server": "Selected server"
+  "Selected server": "Selected server",
+  "Create an account": "Create an account",
+  "Create account": "Create account",
+  "Choose a username": "Choose a username",
+  "Choose a password": "Choose a password",
+  "Registration token, if required": "Registration token, if required",
+  "Back to sign in": "Back to sign in",
+  "Create an account on this server.": "Create an account on this server.",
+  "Check registration details": "Check registration details",
+  "Enter a username and password.": "Enter a username and password.",
+  "Creating account": "Creating account",
+  "Contacting your server…": "Contacting your server…"
 }

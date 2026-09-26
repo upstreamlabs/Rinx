@@ -720,7 +720,8 @@ pub enum MatrixRequest {
     ///
     /// While an SSO request is in flight, the login screen will temporarily prevent the user
     /// from submitting another redundant request, until this request has succeeded or failed.
-    SpawnSSOServer { homeserver_url: String, provider_id: Option<String> },
+    SpawnSSOServer { homeserver_url: String, provider_id: Option<String>, register: bool },
+    RegisterAccount { homeserver_url: String, username: String, password: String, token: String },
     CancelSsoLogin,
     /// Subscribe to typing notices for the given room.
     ///
@@ -2106,11 +2107,11 @@ async fn matrix_worker_task(
                 }
             }
 
-            MatrixRequest::SpawnSSOServer { homeserver_url, provider_id } => {
+            MatrixRequest::SpawnSSOServer { homeserver_url, provider_id, register } => {
                 if sso_task.as_ref().is_some_and(|task| !task.is_finished()) { continue; }
                 let sender = login_sender.clone();
                 sso_task = Some(Handle::current().spawn(async move {
-                    match run_sso_login(homeserver_url, provider_id).await {
+                    match run_sso_login(homeserver_url, provider_id, register).await {
                         Ok((client, session)) => {
                             Cx::post_action(LoginAction::SsoPending(false));
                             Cx::post_action(LoginAction::Status {
@@ -2124,6 +2125,23 @@ async fn matrix_worker_task(
                             Cx::post_action(LoginAction::SsoPending(false));
                             Cx::post_action(LoginAction::LoginFailure(format!("Browser sign-in failed: {error}")));
                         }
+                    }
+                }));
+            }
+            MatrixRequest::RegisterAccount { homeserver_url, username, password, token } => {
+                if sso_task.as_ref().is_some_and(|task| !task.is_finished()) { continue; }
+                let sender = login_sender.clone();
+                sso_task = Some(Handle::current().spawn(async move {
+                    match run_registration(homeserver_url, username, password, token).await {
+                        Ok((client, session)) => {
+                            Cx::post_action(LoginAction::Status {
+                                title: "Finishing registration".into(), status: "Loading your account…".into(),
+                            });
+                            if sender.send(LoginRequest::LoginBySSOSuccess(client, session)).await.is_err() {
+                                Cx::post_action(LoginAction::LoginFailure("Could not finish registration. Restart Rinx and try signing in.".into()));
+                            }
+                        }
+                        Err(error) => Cx::post_action(LoginAction::LoginFailure(format!("Registration failed: {error}"))),
                     }
                 }));
             }
@@ -5668,8 +5686,21 @@ async fn room_avatar(room: &Room, room_name_id: &RoomNameId) -> FetchedRoomAvata
     utils::avatar_from_room_name(room_name_id.name_for_avatar())
 }
 
+async fn run_registration(
+    homeserver_url: String,
+    username: String,
+    password: String,
+    token: String,
+) -> Result<(Client, ClientSessionPersisted)> {
+    let (client, session) = build_client(&Cli {
+        homeserver: Some(homeserver_url), ..Default::default()
+    }, app_data_dir()).await?;
+    crate::login::homeserver::register_account(&client, username, password, token).await?;
+    Ok((client, session))
+}
+
 /// Use only provider IDs advertised by the selected homeserver.
-async fn run_sso_login(homeserver_url: String, provider_id: Option<String>) -> Result<(Client, ClientSessionPersisted)> {
+async fn run_sso_login(homeserver_url: String, provider_id: Option<String>, register: bool) -> Result<(Client, ClientSessionPersisted)> {
     Cx::post_action(LoginAction::Status {
         title: "Connecting to your server".into(),
         status: "Checking browser sign-in support…".into(),
@@ -5680,6 +5711,9 @@ async fn run_sso_login(homeserver_url: String, provider_id: Option<String>) -> R
     let methods = crate::login::homeserver::login_methods(&client).await?;
     if !methods.sso {
         bail!("This server does not advertise Matrix SSO. Use password sign-in if offered. OAuth-only and QR sign-in are not supported yet.");
+    }
+    if register && !methods.browser_registration {
+        bail!("This server does not advertise browser account creation. Try password registration if available.");
     }
     if let Some(id) = provider_id.as_deref() {
         if !methods.providers.iter().any(|provider| provider.id == id) {
@@ -5692,11 +5726,11 @@ async fn run_sso_login(homeserver_url: String, provider_id: Option<String>) -> R
         status: "Choose your server's sign-in provider, complete authentication, then return to Rinx.".into(),
     });
     #[cfg(not(target_os = "ios"))]
-    crate::login::homeserver::browser_login(&client, provider_id.as_deref(), |sso_url| async move {
+    crate::login::homeserver::browser_login(&client, provider_id.as_deref(), register, |sso_url| async move {
         Uri::new(&sso_url).open().map_err(|_| Error::Io(io::Error::other("Unable to open your browser.")))
     }).await?;
     #[cfg(target_os = "ios")]
-    run_ios_sso_flow(&client, provider_id.as_deref()).await?;
+    run_ios_sso_flow(&client, provider_id.as_deref(), register).await?;
     Ok((client, session))
 }
 
@@ -5722,6 +5756,7 @@ async fn warmup_homeserver_connection(client: &Client) -> matrix_sdk::HttpResult
 async fn run_ios_sso_flow(
     client: &Client,
     provider_id: Option<&str>,
+    register: bool,
 ) -> std::result::Result<
     matrix_sdk::ruma::api::client::session::login::v3::Response,
     matrix_sdk::Error,
@@ -5737,6 +5772,11 @@ async fn run_ios_sso_flow(
     let sso_url = auth
         .get_sso_login_url(REDIRECT_URL, provider_id)
         .await?;
+    let sso_url = if register {
+        let mut url = Url::parse(&sso_url).map_err(|e| matrix_sdk::Error::Io(io::Error::other(e)))?;
+        url.query_pairs_mut().append_pair("action", "register");
+        url.into()
+    } else { sso_url };
 
     // Bridge the OS completion callback into a Rust oneshot. Mutex<Option>
     // guards against the OS double-firing, and the same callback clears

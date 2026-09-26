@@ -259,6 +259,38 @@ script_mod! {
                                 text: #(crate::i18n::tr("Sign in with password")) i18n_text: "Sign in with password"
                             }
                         }
+                        register_option_button := ButtonFlat {
+                            width: Fit, height: Fit
+                            text: #(crate::i18n::tr("Create an account")) i18n_text: "Create an account"
+                        }
+                        registration_form := View {
+                            visible: false
+                            width: Fill, height: Fit, flow: Down, spacing: 12
+                            registration_username := RobrixTextInput {
+                                width: Fill, height: Fit, padding: 10
+                                empty_text: #(crate::i18n::tr("Choose a username")) i18n_empty_text: "Choose a username"
+                                autocapitalize: None, autocorrect: Disabled, content_type: Username
+                            }
+                            registration_password := RobrixTextInput {
+                                width: Fill, height: Fit, padding: 10
+                                empty_text: #(crate::i18n::tr("Choose a password")) i18n_empty_text: "Choose a password"
+                                is_password: true, autocapitalize: None, autocorrect: Disabled, content_type: Password
+                            }
+                            registration_token := RobrixTextInput {
+                                width: Fill, height: Fit, padding: 10
+                                empty_text: #(crate::i18n::tr("Registration token, if required")) i18n_empty_text: "Registration token, if required"
+                                autocapitalize: None, autocorrect: Disabled
+                            }
+                            submit_registration_button := RobrixIconButton {
+                                width: Fill, height: 42, padding: 10
+                                align: Align{x: 0.5, y: 0.5}
+                                text: #(crate::i18n::tr("Create account")) i18n_text: "Create account"
+                            }
+                            back_to_login_button := ButtonFlat {
+                                width: Fit, height: Fit
+                                text: #(crate::i18n::tr("Back to sign in")) i18n_text: "Back to sign in"
+                            }
+                        }
                     }
                 }
 
@@ -285,6 +317,7 @@ pub struct LoginScreen {
     #[rust] discovery_pending: bool,
     #[rust] methods: Option<LoginMethods>,
     #[rust] password_form_open: bool,
+    #[rust] registration_form_open: bool,
 
 }
 
@@ -332,10 +365,15 @@ impl LoginScreen {
         self.discovery_pending = false;
         self.methods = None;
         self.password_form_open = false;
+        self.registration_form_open = false;
         self.view.view(cx, ids!(server_step)).set_visible(cx, true);
         self.view.view(cx, ids!(method_step)).set_visible(cx, false);
         self.view.label(cx, ids!(server_status)).set_text(cx, "");
         self.view.text_input(cx, ids!(password_input)).set_text(cx, "");
+        self.view.text_input(cx, ids!(registration_username)).set_text(cx, "");
+        self.view.text_input(cx, ids!(registration_password)).set_text(cx, "");
+        self.view.text_input(cx, ids!(registration_token)).set_text(cx, "");
+        self.view.view(cx, ids!(registration_form)).set_visible(cx, false);
         if self.password_visible {
             self.password_visible = false;
             self.view.text_input(cx, ids!(password_input)).toggle_is_password(cx);
@@ -368,8 +406,10 @@ impl LoginScreen {
         script_apply_eval!(cx, list, {height: #(height)});
         self.view.button(cx, ids!(browser_login_button)).set_visible(cx, has_sso && !has_providers);
         self.view.button(cx, ids!(password_option_button)).set_visible(cx, has_sso && has_password);
+        self.view.button(cx, ids!(register_option_button)).set_visible(cx, methods.browser_registration || (has_password && !methods.oauth_aware_preferred));
         self.password_form_open = has_password && !has_sso;
         self.view.view(cx, ids!(password_form)).set_visible(cx, self.password_form_open);
+        self.view.view(cx, ids!(registration_form)).set_visible(cx, false);
         self.view.view(cx, ids!(server_step)).set_visible(cx, false);
         self.view.view(cx, ids!(method_step)).set_visible(cx, true);
         self.methods = Some(methods);
@@ -379,7 +419,9 @@ impl LoginScreen {
 
     fn refresh_method_copy(&mut self, cx: &mut Cx) {
         let Some(methods) = self.methods.as_ref() else { return };
-        let description = if self.password_form_open {
+        let description = if self.registration_form_open {
+            crate::i18n::tr("Create an account on this server.")
+        } else if self.password_form_open {
             crate::i18n::tr("This server supports password sign-in.")
         } else if methods.sso && !methods.providers.is_empty() {
             crate::i18n::tr("Choose a sign-in provider. Your server handles authentication in the browser.")
@@ -396,13 +438,13 @@ impl LoginScreen {
         });
     }
 
-    fn start_sso(&mut self, cx: &mut Cx, provider_id: Option<String>) {
-        let Some(methods) = self.methods.as_ref().filter(|m| m.sso) else { return };
+    fn start_sso(&mut self, cx: &mut Cx, provider_id: Option<String>, register: bool) {
+        let Some(methods) = self.methods.as_ref().filter(|m| m.sso && (!register || m.browser_registration)) else { return };
         self.login_pending = true;
         self.sso_pending = true;
         let destination = methods.homeserver.clone();
         self.show_status(cx, crate::i18n::tr("Connecting to your server"), &crate::i18n::format("Checking browser sign-in for {destination}…", &[("destination", destination.clone())]), crate::i18n::tr("Cancel"), true);
-        submit_async_request(MatrixRequest::SpawnSSOServer { homeserver_url: destination, provider_id });
+        submit_async_request(MatrixRequest::SpawnSSOServer { homeserver_url: destination, provider_id, register });
     }
 }
 
@@ -471,13 +513,45 @@ impl MatchEvent for LoginScreen {
                 Err(error) => self.show_status(cx, crate::i18n::tr("Check sign-in details"), &error.to_string(), crate::i18n::tr("Okay"), true),
             }
         }
-        if self.view.button(cx, ids!(password_option_button)).clicked(actions) {
+        if !self.registration_form_open && self.view.button(cx, ids!(password_option_button)).clicked(actions) {
             self.password_form_open = !self.password_form_open;
             self.view.view(cx, ids!(password_form)).set_visible(cx, self.password_form_open);
             self.refresh_method_copy(cx);
         }
+        if !self.login_pending && self.view.button(cx, ids!(register_option_button)).clicked(actions) {
+            if self.methods.as_ref().is_some_and(|methods| methods.browser_registration) {
+                self.start_sso(cx, None, true);
+            } else if self.methods.as_ref().is_some_and(|methods| methods.password) {
+                self.registration_form_open = true;
+                self.view.view(cx, ids!(provider_list_container)).set_visible(cx, false);
+                self.view.button(cx, ids!(browser_login_button)).set_visible(cx, false);
+                self.view.button(cx, ids!(password_option_button)).set_visible(cx, false);
+                self.view.view(cx, ids!(password_form)).set_visible(cx, false);
+                self.view.button(cx, ids!(register_option_button)).set_visible(cx, false);
+                self.view.view(cx, ids!(registration_form)).set_visible(cx, true);
+                self.refresh_method_copy(cx);
+            }
+        }
+        if !self.login_pending && self.view.button(cx, ids!(back_to_login_button)).clicked(actions) {
+            if let Some(methods) = self.methods.clone() {
+                self.registration_form_open = false;
+                self.show_methods(cx, methods);
+            }
+        }
+        if !self.login_pending && self.registration_form_open && self.view.button(cx, ids!(submit_registration_button)).clicked(actions) {
+            let username = self.view.text_input(cx, ids!(registration_username)).text().trim().to_owned();
+            let password = self.view.text_input(cx, ids!(registration_password)).text();
+            let token = self.view.text_input(cx, ids!(registration_token)).text().trim().to_owned();
+            if username.is_empty() || password.is_empty() {
+                self.show_status(cx, crate::i18n::tr("Check registration details"), crate::i18n::tr("Enter a username and password."), crate::i18n::tr("Okay"), true);
+            } else if let Some(homeserver_url) = self.methods.as_ref().map(|methods| methods.homeserver.clone()) {
+                self.login_pending = true;
+                self.show_status(cx, crate::i18n::tr("Creating account"), crate::i18n::tr("Contacting your server…"), crate::i18n::tr("Please wait…"), false);
+                submit_async_request(MatrixRequest::RegisterAccount { homeserver_url, username, password, token });
+            }
+        }
         if !self.login_pending && self.view.button(cx, ids!(browser_login_button)).clicked(actions) {
-            self.start_sso(cx, None);
+            self.start_sso(cx, None, false);
         }
         if !self.login_pending {
             let selected_provider = self.view.portal_list(cx, ids!(provider_list))
@@ -489,7 +563,7 @@ impl MatchEvent for LoginScreen {
                     } else { None }
                 });
             if let Some(provider_id) = selected_provider {
-                self.start_sso(cx, Some(provider_id));
+                self.start_sso(cx, Some(provider_id), false);
             }
         }
 
@@ -549,6 +623,8 @@ impl MatchEvent for LoginScreen {
         self.view.button(cx, ids!(browser_login_button)).set_enabled(cx, !self.login_pending);
         self.view.button(cx, ids!(edit_server_button)).set_enabled(cx, !self.login_pending);
         self.view.button(cx, ids!(continue_server_button)).set_enabled(cx, !self.login_pending && !self.discovery_pending);
+        self.view.button(cx, ids!(register_option_button)).set_enabled(cx, !self.login_pending);
+        self.view.button(cx, ids!(submit_registration_button)).set_enabled(cx, !self.login_pending);
         self.redraw(cx);
     }
 }
