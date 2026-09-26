@@ -1,7 +1,7 @@
 # ADR 0005: Octoscript mini apps with Matrix and Octos services
 
 - Date: 2026-09-26
-- Status: Accepted; implemented and natively verified, with live model generation blocked by provider authentication
+- Status: Accepted; implemented and natively verified, including live model generation on macOS and Android
 - Supersedes the general-runtime deferral in ADR 0002. The article editor and its grants remain supported.
 
 ## Outcome
@@ -80,18 +80,20 @@ Remote `main` was checked again at 10:37 UTC: desktop `57f4665c` and ROM Home `5
 | Check | Result |
 | --- | --- |
 | Portable request parsing, grants, account/room isolation and revocation | 30 tests pass |
-| Rinx bundle admission, state updates, stream isolation and turn IDs | 7 tests pass |
+| Rinx bundle admission, state updates, stream isolation and turn IDs | 8 tests pass, including persisted answers arriving before the last deltas |
 | Shared transport, correlated replies and local storage configuration | 33 tests pass |
 | AppCard store/render and remaining workspace tests | 45 tests pass; one transport doc test ignored |
 | AppCard main library suite | 191 pass, 7 fail, 3 ignored; identical failures reproduced from clean `4d99cb5` app sources against the locked framework sources |
 | AppCard workspace check and clippy (`--all-targets --no-deps -- -D warnings`) | Pass |
 | Desktop native mini apps | Both bundle formats render; live Matrix profile and Octos session open/history work; continuous Chinese/emoji input, close/reopen, and one shared core process verified |
 | Android native mini apps | Both bundle formats render; live Matrix profile, Octos session open/history, continuous input, keyboard dismissal and close/reopen work. A Back key and an actual system edge swipe each return to Rinx Discover without exiting Rinx; one shared core process verified |
-| Live model generation | Not passed: the configured DeepSeek provider returns HTTP 401. No generated answer or tool-approval success is claimed |
+| Live model generation | Pass after updating the private test credentials: both L0 and `main.splash` mini apps receive real DeepSeek answers on macOS and Android through the shared AppCard core. Native tool approvals remain unverified |
 
 The seven baseline AppCard failures concern L0 exemplar/capability/theme drift: `every_call_the_lowering_emits_has_a_helper`, `the_nav_exemplar_is_the_card_the_profile_tests_check`, `l0_theme_axes_are_all_answered`, `a_live_source_without_its_capability_is_visibly_wrong`, `a_watch_row_reveals_its_own_remove`, `nav_is_generated_from_an_l0_spec`, and `the_language_reference_lists_every_admitted_theme`. They are not suppressed or weakened by this change.
 
 Native verification caught and fixed lost generated-label updates, missing font fallback in L0 inputs, the core profile's rejection of a workspace outside its read allowlist, and two Android Back deliveries from one key press. Parallel import tests caught a timestamp collision: admitted snapshots now use UUID names, and failed directory creation cannot acquire cleanup ownership over an existing snapshot.
+
+The live-generation follow-up caught a response-ordering race on Android: a complete `assistant_persisted` answer arrived before the final streaming fragments for the same segment. Rinx now treats that saved answer as authoritative and ignores later deltas for that segment, including when a newer segment has begun. A regression test reproduces this ordering. The rebuilt phone app displayed both generated answers exactly as saved by the core, with one shared core process. On macOS, changing the L0 prompt to ask 17 + 25 returned `42`; the script bundle also received a real answer. Credentials remain outside the repositories.
 
 The phone's installed base image is `octosense-202609240442`, matching the latest local OTA in `rom-builds/20260924-display` (Android 15 / SDK 35). This work installs current ROM Home application code as `dev.makepad.octosense.rinx`; it does not flash a new system image or replace the normal `dev.makepad.octosense` launcher. Standalone Rinx is build-checked; its remote-provider UI has not been exercised against a separate live server. Write-side Matrix calls and native tool approvals were not exercised against live services.
 
@@ -102,9 +104,9 @@ Both release builds passed and were exercised natively. Paths below are relative
 | Artifact | Path | SHA-256 |
 | --- | --- | --- |
 | macOS executable | `OctoSense/target/release/octosense` | `d3321ce95393c5b606d67b56af932f15aa63e444cef5bdcaee399d7fa77440d5` |
-| Android test APK | `OctoSense-ROM-rinx-latest/home/target/android/makepad-android-apk/octosense/apk/octo_senserinx.apk` | `9ebd5487876252695d2a365b70d7c02207617d2cc64979cd8b34386cd19585a8` |
+| Android test APK, response-ordering follow-up | `OctoSense-ROM-rinx-latest/home/target/android/makepad-android-apk/octosense/apk/octo_senserinx.apk` | `a74091a6bb4857533aa37b6ea34a152807e88d7d4536ce0e2e63139284f1aadc` |
 
-The owned desktop and phone test instances were closed after validation. The Android test APK remains installed for manual testing. The coordinated commits and PRs below publish the tested implementation. Dependency source identities and lockfiles were normalized after native validation; the recorded binary hashes identify the preceding native test builds.
+The owned desktop and phone test instances were closed after validation. The Android test APK remains installed for manual testing. The coordinated commits and PRs below publish the tested implementation. Dependency source identities and lockfiles were normalized after the initial native validation. The Android follow-up used the published dependency pins and a temporary local Rinx override for the response-ordering fix; the macOS artifact predates that fix. Native test builds also include the developer checkout's unrelated homeserver timeout change, which is excluded from this PR.
 
 ### Published dependency commits
 

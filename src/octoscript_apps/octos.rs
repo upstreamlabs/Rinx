@@ -238,6 +238,7 @@ struct TurnReply {
     text: String,
     segment: String,
     sequence: std::collections::BTreeMap<String, u64>,
+    persisted_segments: std::collections::BTreeSet<String>,
     v2: bool,
     completed: bool,
 }
@@ -269,6 +270,15 @@ impl TurnReply {
                 match payload["type"].as_str().unwrap_or("") {
                     "assistant_delta" | "assistant_persisted" => {
                         let segment = data["assistant_segment_id"].as_str().unwrap_or("");
+                        // Persistence and live deltas travel on separate core
+                        // lanes. A complete saved answer may precede higher-
+                        // sequence deltas for the same segment; those fragments
+                        // are already included in the saved text.
+                        if payload["type"] == "assistant_delta"
+                            && self.persisted_segments.contains(segment)
+                        {
+                            return Ok(false);
+                        }
                         if !self.v2 || self.segment != segment {
                             self.text.clear();
                             self.segment = segment.into();
@@ -276,6 +286,7 @@ impl TurnReply {
                         self.v2 = true;
                         let text = data["text"].as_str().unwrap_or("");
                         if payload["type"] == "assistant_persisted" {
+                            self.persisted_segments.insert(segment.to_owned());
                             self.text = text.into();
                         } else {
                             self.text.push_str(text);
@@ -309,6 +320,66 @@ impl TurnReply {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn persisted_answers_ignore_late_deltas_without_blocking_new_segments() {
+        let mut reply = TurnReply::default();
+        let event = |seq, kind, segment, text| {
+            json!({"kind":"envelope_v2","envelope":{
+                "turn_id":"owned","thread_id":"thread","seq":seq,
+                "payload":{"type":kind,"data":{
+                    "assistant_segment_id":segment,"text":text
+                }}
+            }})
+        };
+        reply
+            .accept("owned", &event(1, "assistant_delta", "first", "Hello"))
+            .unwrap();
+        reply
+            .accept(
+                "owned",
+                &event(2, "assistant_persisted", "first", "Hello! How can I help?"),
+            )
+            .unwrap();
+        assert!(
+            !reply
+                .accept(
+                    "owned",
+                    &event(3, "assistant_delta", "first", "! How can I help?")
+                )
+                .unwrap()
+        );
+        assert_eq!(reply.text, "Hello! How can I help?");
+        assert!(
+            reply
+                .accept(
+                    "owned",
+                    &event(4, "assistant_delta", "next", "Another answer")
+                )
+                .unwrap()
+        );
+        assert!(
+            !reply
+                .accept(
+                    "owned",
+                    &event(5, "assistant_delta", "first", "late old fragment")
+                )
+                .unwrap()
+        );
+        assert_eq!(reply.text, "Another answer");
+        reply
+            .accept(
+                "owned",
+                &event(6, "assistant_persisted", "next", "Another answer."),
+            )
+            .unwrap();
+        assert!(
+            !reply
+                .accept("owned", &event(7, "assistant_delta", "next", "."))
+                .unwrap()
+        );
+        assert_eq!(reply.text, "Another answer.");
+    }
+
     #[test]
     fn v2_final_replaces_deltas_and_ignores_other_turns_and_replay() {
         let mut reply = TurnReply::default();
